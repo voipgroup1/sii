@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>sii — WebGPU GIF 编辑器</title>
+<!-- 中文字体 8.4 MB，wasm 启动后才开始取的话要串行等两次下载。
+     这里提前拉一把，和 wasm 并行；wasm 里 fetch 同一个 URL 会命中缓存。 -->
+<link rel="preload" href="assets/puhuiti-55-regular.ttf" as="fetch" crossorigin="anonymous">
 <style>
   :root {
     --bg: #0b0b0e;

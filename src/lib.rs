@@ -14,8 +14,8 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wgpu_gameui::{
-    shared_font_system, DrawList, Frame, InputState, KeyboardNav, Theme, UiContext, UiRenderer,
-    UiState,
+    load_font_bytes, shared_font_system, DrawList, FontSystemHandle, Frame, InputState,
+    KeyboardNav, Theme, UiContext, UiRenderer, UiState,
 };
 
 use gifdoc::Doc;
@@ -227,6 +227,17 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("sii frame encoder"),
             });
+
+        // UI 渲染器的帧边界，必须每帧调一次，且要在本次 submit 的第一个 pass
+        // 之前。它把 uniform / 顶点 / 实例这些 bump 分配器的游标归零。
+        //
+        // 漏掉的话每帧都在上一帧的游标位置继续往后追加：缓冲区一路涨，
+        // 涨到 ARENA_SANITY_CAP 之后渲染器直接拒绝画东西。表现出来就是
+        // 画面闪一下（第一帧）然后再也不动。
+        //
+        // 别和 `Frame::run` 内部那个 `UiState::begin_frame` 搞混 —— 那个管的是
+        // 布局和交互状态，跟 GPU 缓冲区一点关系没有。
+        self.ui.begin_frame();
 
         let dpr = self.viewport.borrow().0;
         let _ = dpr;
@@ -1063,6 +1074,13 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     surface.configure(&device, &config);
 
     let font_system = shared_font_system();
+    // 自带的 bundled-font 是 Noto Sans 的拉丁子集，没有汉字字形，中文全是豆腐块。
+    // 拉一份阿里巴巴普惠体 2.0 注册成默认 sans-serif，UI 里没显式指定字体族的
+    // 文本就都能落到它上面。加载失败不阻断启动 —— 顶多中文不显示，界面还能用。
+    match load_cjk_font(&font_system).await {
+        Ok(family) => log::info!("中文字体就绪：{family}"),
+        Err(e) => log::warn!("中文字体加载失败，中文会显示成方块：{e}"),
+    }
     let ui = UiRenderer::new(&device, &queue, format, font_system.clone());
     let draw_list = DrawList::with_font_system(font_system);
     let preview = canvas::Preview::new(&device, format, 1, 1);
@@ -1140,4 +1158,56 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     *slot.borrow_mut() = Some(closure);
 
     Ok(())
+}
+
+// ------------------------------------------------------------------ 字体
+
+/// 阿里巴巴普惠体 2.0（55 Regular）的部署路径，相对于 index.html。
+const CJK_FONT_URL: &str = "assets/puhuiti-55-regular.ttf";
+
+/// 拉取普惠体并注册成默认 sans-serif。
+///
+/// 为什么运行时 fetch 而不是 `include_bytes!`：字体 5.5 MB，编进 wasm 会让
+/// 产物从 3.4 MB 涨到 9 MB，而且整个 wasm 得先下完才能启动 —— 等于把字体的
+/// 下载时间直接叠加到白屏时间上。单独 fetch 的话 wasm 先起来、界面先出现，
+/// 字体随后补上，中文从豆腐块变成正常字。
+///
+/// 失败的后果只有"中文不显示"，所以调用方只记日志、不中断启动。
+async fn load_cjk_font(fs: &FontSystemHandle) -> Result<String, String> {
+    let win = web_sys::window().ok_or_else(|| "没有 window".to_string())?;
+
+    let resp: web_sys::Response =
+        wasm_bindgen_futures::JsFuture::from(win.fetch_with_str(CJK_FONT_URL))
+            .await
+            .map_err(|e| format!("请求 {CJK_FONT_URL} 失败：{e:?}"))?
+            .dyn_into()
+            .map_err(|_| "fetch 返回的不是 Response".to_string())?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP {}（{CJK_FONT_URL}）", resp.status()));
+    }
+
+    let buf = wasm_bindgen_futures::JsFuture::from(
+        resp.array_buffer()
+            .map_err(|e| format!("读取响应体失败：{e:?}"))?,
+    )
+    .await
+    .map_err(|e| format!("读取响应体失败：{e:?}"))?;
+
+    let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+    // 字体文件被网关塞了错误页之类的情况，早点报出来比在 fontdb 里炸强
+    if bytes.len() < 1024 {
+        return Err(format!("字体文件只有 {} 字节，明显不对", bytes.len()));
+    }
+
+    let handle = load_font_bytes(fs, &bytes)?;
+
+    // 设成默认 sans-serif：cosmic-text 按族名选字体，UI 里所有没显式指定
+    // 字体族的文本都会落到这个族上。
+    fs.lock()
+        .map_err(|_| "FontSystem 被 poison".to_string())?
+        .db_mut()
+        .set_sans_serif_family(handle.family().to_string());
+
+    Ok(format!("{}（{} 字节）", handle.family(), bytes.len()))
 }

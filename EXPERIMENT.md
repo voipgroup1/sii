@@ -141,6 +141,69 @@ const DISABLE_UNIFORMITY_REQ_FOR_FRAGMENT_STAGE: bool = true;
 教训：**"编译通过"和"能跑"之间隔着 GPU 驱动那一层。** 纯 CPU 侧的测试覆盖不到
 shader 语义，这类错误只能靠规范知识 + 源码级约束兜。
 
+### 3.8 漏调 `UiRenderer::begin_frame` —— 画面只闪一帧
+
+现象：预览区第一帧有内容，然后整个画布冻住不动。没有报错，没有 warning。
+
+原因：`wgpu-gameui` 里有两个同名方法，很容易只调一个就以为齐了。
+
+- `UiState::begin_frame` —— 由 `Frame::run` 内部自动调用，管布局和交互状态。
+- `UiRenderer::begin_frame` —— **必须自己每帧调一次**，管 GPU 缓冲区。
+
+`UiRenderer` 用 bump 分配器管理 uniform、顶点、实例这些 per-frame 缓冲区。
+`begin_frame` 把游标归零，让每一帧从缓冲区头部重新写。漏掉它，第二帧就在
+第一帧的游标位置上继续往后追加，缓冲区一路涨；涨到 `ARENA_SANITY_CAP`
+之后渲染器直接拒绝出图 —— 表现就是"闪一下就没了"。
+
+还有一层更隐蔽的：`Queue::write_buffer` 不是立即生效的，它在下次 `submit`
+开头才执行。同一次 submit 里的多个 pass 会全部读到**最后一个** pass 写的字节，
+除非每个 pass 各自持有一段独立的字节范围。`begin_frame` 就是划分这个边界的。
+
+修法就一行，位置有讲究 —— 必须在本次 `submit` 的第一个 pass 之前：
+
+```rust
+let mut encoder = self.device.create_command_encoder(&desc);
+self.ui.begin_frame();   // ← 在这里，不是构造函数里，也不是帧末
+self.preview.draw(...);
+self.ui.render(...);
+self.queue.submit(Some(encoder.finish()));
+```
+
+教训：**库里有同名方法时，先搞清楚哪个是自动的、哪个要手动调。** 这类
+"沉默的 API 契约"不会报错，只会让画面静静地停住。
+
+### 3.9 中文字体：自带字体里没有汉字
+
+现象：UI 里的中文全是豆腐块（□□□），英文数字正常。
+
+原因：`wgpu-gameui` 的 `bundled-font` feature 加载的是 Noto Sans 的
+regular / bold / italic / bold-italic 四个字重，**只有拉丁子集，没有汉字字形**。
+`register_bundled_fonts` 会把 Noto Sans 设成默认 sans-serif，于是所有文本
+都往这个没有汉字的字体上落。
+
+修法：注册一份中文字体并抢过默认 sans-serif 的位置。
+
+```rust
+let font_system = shared_font_system();      // 内部已加载 Noto Sans
+let handle = load_font_bytes(&font_system, &bytes)?;
+font_system.lock().unwrap()
+    .db_mut()
+    .set_sans_serif_family(handle.family().to_string());
+```
+
+用的是**阿里巴巴普惠体 2.0**（55 Regular），8.45 MB，29030 个字形，覆盖
+GB2312 / GBK 和 CJK 统一汉字基本区。免费商用，可分发可嵌入。
+
+**为什么运行时 fetch 而不是 `include_bytes!`**：8.45 MB 编进 wasm 会让产物
+从 3.4 MB 涨到 12 MB，而且整个 wasm 得先下完才能启动 —— 等于把字体的下载
+时间直接叠加到白屏时间上。单独 fetch 的话 wasm 先起来、界面先出现，字体
+随后补上。`index.html` 里再加一条 `<link rel="preload" as="fetch">`，让它和
+wasm 并行下载，wasm 里那次 fetch 就命中缓存了。
+
+**注意 `FontHandle` 只是族名字符串**。cosmic-text 按族名选字体，所以"加载
+字体"和"让 UI 用上它"是两件事：前者是 `load_font_bytes`，后者是
+`set_sans_serif_family`。只做前者，中文照样是豆腐块。
+
 ## 4. 实测数据
 
 Node 22 里加载真实 wasm（不是 mock），`performance.now()` 在外部计时：
