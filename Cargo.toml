@@ -1,0 +1,78 @@
+[package]
+name = "sii"
+version = "0.1.0"
+edition = "2021"
+description = "WebGPU-accelerated GIF viewer & editor. Pure frontend, no backend."
+license = "MIT"
+repository = "https://github.com/voipgroup1/sii"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# UI 层：自定义 wgpu 即时模式 UI 库（同一账号下的 wgpu-gameui）
+# 默认特性里的 headless 依赖 pollster/axum/tokio，wasm 下用不到，关掉。
+wgpu-gameui = { git = "https://github.com/voipgroup1/wgpu-gameui", default-features = false, features = [
+    "bundled-font",
+    "phosphor-icons",
+] }
+
+wgpu = { version = "30", features = ["webgpu"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+log = "0.4"
+console_error_panic_hook = "0.1"
+
+# GIF 编解码（纯 Rust，wasm 友好）
+gif = "0.13"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "console",
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "HtmlInputElement",
+    "Node",
+    "Event",
+    "EventTarget",
+    "MouseEvent",
+    "PointerEvent",
+    "WheelEvent",
+    "KeyboardEvent",
+    "DomRect",
+    "CssStyleDeclaration",
+    "Performance",
+    "ResizeObserver",
+    "ResizeObserverEntry",
+    "ResizeObserverSize",
+    "File",
+    "FileList",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "Response",
+    "Request",
+    "RequestInit",
+    "Headers",
+    "StorageManager",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemWritableFileStream",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemCreateWritableOptions",
+]
+
+[profile.release]
+opt-level = "s"
+# fat LTO 在 1.9G 内存的单核沙箱里容易 OOM，thin 已经够用
+lto = "thin"
+codegen-units = 1
+panic = "abort"

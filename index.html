@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>sii — WebGPU GIF 编辑器</title>
+<style>
+  :root {
+    --bg: #0b0b0e;
+    --fg: #e8e8ee;
+    --dim: #8b8b99;
+    --accent: #4f8cff;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.5 ui-sans-serif, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  #sii-canvas {
+    display: block; width: 100vw; height: 100vh;
+    touch-action: none; outline: none; cursor: crosshair;
+  }
+  #boot {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px;
+    background: var(--bg); z-index: 40; text-align: center; padding: 24px;
+  }
+  #boot.hidden { display: none; }
+  #boot .title { font-size: 22px; font-weight: 600; letter-spacing: .04em; }
+  #boot .msg { color: var(--dim); max-width: 620px; white-space: pre-wrap; text-align: left; }
+  #boot .msg.err { color: #ff7a7a; }
+  .spinner {
+    width: 26px; height: 26px; border-radius: 50%;
+    border: 2px solid #26262e; border-top-color: var(--accent);
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #drop {
+    position: fixed; inset: 0; z-index: 30; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(11,11,14,.82);
+    border: 2px dashed var(--accent); border-radius: 12px; margin: 12px;
+    font-size: 18px; letter-spacing: .04em; pointer-events: none;
+  }
+  #drop.on { display: flex; }
+  kbd {
+    font: 11px/1 ui-monospace, monospace; background: #1b1b22;
+    border: 1px solid #2c2c36; border-radius: 4px; padding: 2px 5px; color: var(--dim);
+  }
+</style>
+</head>
+<body>
+<canvas id="sii-canvas"></canvas>
+
+<input id="sii-file" type="file" accept="image/gif,image/*" hidden>
+
+<div id="drop">松手就打开</div>
+
+<div id="boot">
+  <div class="title">sii</div>
+  <div class="spinner" id="boot-spin"></div>
+  <div class="msg" id="boot-msg">正在初始化 WebGPU…</div>
+  <div class="msg" style="font-size:12px">
+    <kbd>空格</kbd> 播放/暂停　<kbd>,</kbd> <kbd>.</kbd> 上一帧/下一帧　
+    <kbd>-</kbd> <kbd>=</kbd> 缩放　<kbd>0</kbd> 适应　<kbd>Home</kbd> <kbd>End</kbd> 首/末帧
+  </div>
+</div>
+
+<script type="module">
+// =====================================================================
+//  JS 侧只做三件事：读文件、写文件、拉 DuckDB。
+//  所有解码 / 合成 / 编辑 / 编码都在 wasm 里，UI 也在 wasm 里画。
+// =====================================================================
+
+const bootEl  = document.getElementById('boot');
+const bootMsg = document.getElementById('boot-msg');
+const bootSpin= document.getElementById('boot-spin');
+const dropEl  = document.getElementById('drop');
+const fileEl  = document.getElementById('sii-file');
+
+function setBoot(msg, isErr = false) {
+  bootMsg.textContent = msg;
+  bootMsg.classList.toggle('err', isErr);
+}
+function hideBoot() { bootEl.classList.add('hidden'); }
+
+// ---------------------------------------------------------------- DuckDB 桥
+const duck = {
+  db: null, conn: null, ready: null,
+
+  async init() {
+    if (this.ready) return this.ready;
+    this.ready = (async () => {
+      // 懒加载：不点按钮就不下载 ~30MB 的 duckdb wasm
+      const duckdb = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm');
+      const bundles = duckdb.getJsDelivrBundles();
+      const bundle = await duckdb.selectBundle(bundles);
+      const workerUrl = URL.createObjectURL(new Blob(
+        [`importScripts(${JSON.stringify(bundle.mainWorker)});`],
+        { type: 'text/javascript' }
+      ));
+      const worker = new Worker(workerUrl);
+      const logger = new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING);
+      this.db = new duckdb.AsyncDuckDB(logger, worker);
+      await this.db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      URL.revokeObjectURL(workerUrl);
+      this.conn = await this.db.connect();
+      return 'ok';
+    })();
+    return this.ready;
+  },
+
+  async exec(sql) {
+    await this.init();
+    const table = await this.conn.query(sql);
+    const rows = [];
+    const n = Math.min(table.numRows, 32);
+    for (let i = 0; i < n; i++) {
+      const row = table.get(i);
+      try { rows.push(row.toJSON()); } catch { rows.push({}); }
+    }
+    return JSON.stringify({ numRows: table.numRows, rows });
+  },
+};
+
+// ---------------------------------------------------------------- 对外桥
+const current = { name: 'output.gif' };
+
+window.__sii = {
+  duck,
+
+  openFile() { fileEl.click(); },
+
+  download(bytes) {
+    const blob = new Blob([bytes], { type: 'image/gif' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = current.name.replace(/\.gif$/i, '') + '-edited.gif';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  },
+};
+
+// ---------------------------------------------------------------- 文件加载
+let wasmApi = null;
+
+async function openGifFile(file) {
+  if (!file) return;
+  if (!/\.gif$/i.test(file.name) && file.type !== 'image/gif') {
+    setBoot(`只支持 .gif，收到的是 ${file.type || file.name}`, true);
+    return;
+  }
+  current.name = file.name;
+  const buf = await file.arrayBuffer();
+  try {
+    const summary = wasmApi.load_gif(new Uint8Array(buf));
+    console.log('[sii]', summary);
+    hideBoot();
+  } catch (e) {
+    setBoot('解码失败：' + (e?.message ?? e), true);
+  }
+}
+
+fileEl.addEventListener('change', () => {
+  openGifFile(fileEl.files?.[0]);
+  fileEl.value = '';
+});
+
+let dragDepth = 0;
+window.addEventListener('dragenter', e => {
+  e.preventDefault();
+  dragDepth++;
+  dropEl.classList.add('on');
+});
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('dragleave', e => {
+  e.preventDefault();
+  if (--dragDepth <= 0) { dragDepth = 0; dropEl.classList.remove('on'); }
+});
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  dragDepth = 0;
+  dropEl.classList.remove('on');
+  const f = e.dataTransfer?.files?.[0];
+  if (f) openGifFile(f);
+});
+
+// ---------------------------------------------------------------- 键盘
+window.addEventListener('keydown', e => {
+  if (!wasmApi) return;
+  const tag = (e.target?.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea') return;
+  wasmApi.key(e.code);
+  if (e.code === 'Space') e.preventDefault();
+});
+
+// ---------------------------------------------------------------- 启动
+(async () => {
+  if (!navigator.gpu) {
+    bootSpin.style.display = 'none';
+    setBoot(
+      '这个浏览器没有 WebGPU。\n\n' +
+      '需要 Chrome / Edge 113+（桌面版），或者开启 chrome://flags/#enable-unsafe-webgpu。\n' +
+      'Safari 需要 18+ 并且手动打开 WebGPU 开关。',
+      true
+    );
+    return;
+  }
+  try {
+    const mod = await import('./pkg/sii.js');
+    await mod.default();
+    wasmApi = mod;
+    await mod.start('sii-canvas');
+    bootSpin.style.display = 'none';
+    setBoot('WebGPU 就绪 —— 点左上角「打开 GIF」，或者直接把文件拖进来');
+    // 留一行提示，不自动消失；打开文件后由 openGifFile 收掉
+  } catch (e) {
+    bootSpin.style.display = 'none';
+    setBoot('初始化失败：\n' + (e?.stack || e?.message || e), true);
+    console.error(e);
+  }
+})();
+</script>
+</body>
+</html>
