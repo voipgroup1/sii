@@ -29,6 +29,12 @@ console_error_panic_hook = "0.1"
 # GIF 编解码（纯 Rust，wasm 友好）
 gif = "0.13"
 
+# 只用于单元测试：拿 wgpu 自己的 WGSL 前端校验 shader。
+# 沙箱里没有浏览器，shader 错了只能等用户打开页面才发现，
+# 这个依赖让 `cargo test` 就能拦住语法和 uniformity 违规。
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
+
 [dependencies.web-sys]
 version = "0.3"
 features = [

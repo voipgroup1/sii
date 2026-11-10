@@ -1242,6 +1242,7 @@ dependencies = [
  "gif",
  "js-sys",
  "log",
+ "naga",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

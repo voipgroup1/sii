@@ -1022,6 +1022,9 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
 
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
+            // Windows 上的 Chrome 会忽略这个选项并在 console 打一条警告
+            // （crbug.com/369219127），不影响功能；macOS 上它能触发独显，
+            // 所以留着。看到那条 warning 不用管。
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,

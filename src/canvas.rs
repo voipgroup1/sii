@@ -42,16 +42,24 @@ fn vs(@builtin(vertex_index) idx: u32) -> VsOut {
 
 @fragment
 fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    // 帧缓冲像素坐标 -> 图像 uv
-    let uv = (frag.xy - view.img.xy) / view.img.zw;
+    // 帧缓冲像素坐标 -> 图像 uv。尺寸兜个底，避免 0 尺寸文档除出 NaN。
+    let size = max(view.img.zw, vec2<f32>(1.0));
+    let uv = (frag.xy - view.img.xy) / size;
 
-    var rgb = vec3<f32>(0.0);
-    var a = 0.0;
-    if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
-        let t = textureSample(frame_tex, frame_samp, uv);
-        rgb = t.rgb;
-        a = t.a;
-    }
+    // 不能用 textureSample：它要隐式求导来选 mip level，WGSL 规范要求
+    // 必须在 uniform control flow 里调用。而"这个像素是否落在图像内"依赖
+    // frag 坐标（非 uniform），放进 if 里直接编译失败。
+    // 改成 textureSampleLevel 显式指定 level 0 —— 这张纹理只有一级 mip，
+    // 采样结果与 textureSample 完全一致，但不受控制流约束。
+    let inside = uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+    let t = textureSampleLevel(
+        frame_tex,
+        frame_samp,
+        clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)),
+        0.0,
+    );
+    let rgb = t.rgb;
+    let a = select(0.0, t.a, inside);
 
     // 棋盘格背景，用来显示 GIF 的透明区域
     let cell = max(view.misc.x, 4.0);
@@ -342,5 +350,68 @@ impl Preview {
 
     pub fn texture_view(&self) -> &wgpu::TextureView {
         &self.texture_view
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SHADER;
+
+    /// 用 naga（wgpu 自己的 WGSL 前端）解析并校验 shader。
+    ///
+    /// 能覆盖语法、类型、绑定这些硬错误，但**覆盖不到 uniformity** ——
+    /// 原因见下一个测试。沙箱里没有浏览器，shader 写错了只能等用户打开页面
+    /// 才发现，多一层静态检查总比没有强。
+    #[test]
+    fn shader_parses_and_validates() {
+        let module = match naga::front::wgsl::parse_str(SHADER) {
+            Ok(m) => m,
+            Err(e) => panic!("WGSL 解析失败：\n{}", e.emit_to_string(SHADER)),
+        };
+
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        );
+        if let Err(e) = validator.validate(&module) {
+            panic!("WGSL 校验失败：{e:?}");
+        }
+    }
+
+    /// 禁止使用隐式求导的纹理采样函数。
+    ///
+    /// 为什么 naga 的 validator 帮不上忙：naga 30 的 `valid/analyzer.rs` 里有一行
+    /// 硬编码 `DISABLE_UNIFORMITY_REQ_FOR_FRAGMENT_STAGE = true`，主动关掉了
+    /// fragment 阶段的 uniformity 检查。于是 `textureSample` 放进依赖 frag 坐标的
+    /// if 里，naga 一声不吭，但 Chrome 的 Tint 会直接拒绝编译：
+    ///
+    /// ```text
+    /// error: 'textureSample' must only be called from uniform control flow
+    /// ```
+    ///
+    /// 结果就是整条预览管线创建失败，画面上什么都没有。
+    /// 这里退化成源码级约束：隐式 LOD 的采样一律不许用，必须显式写
+    /// `textureSampleLevel(..., 0.0)`。本项目所有纹理都只有一级 mip，语义完全等价。
+    #[test]
+    fn shader_avoids_implicit_lod_sampling() {
+        const BANNED: [&str; 3] = [
+            "textureSample(",
+            "textureSampleBias(",
+            "textureSampleCompare(",
+        ];
+        for (i, raw) in SHADER.lines().enumerate() {
+            // 跳过注释，否则解释性文字会被误判
+            let code = raw.split("//").next().unwrap_or("");
+            for pat in BANNED {
+                if code.contains(pat) {
+                    panic!(
+                        "第 {} 行用了 `{pat}`：它隐含求导来选 mip level，\
+                         WGSL 规范要求必须在 uniform control flow 中调用。\
+                         改用 textureSampleLevel(tex, samp, uv, 0.0)。",
+                        i + 1
+                    );
+                }
+            }
+        }
     }
 }

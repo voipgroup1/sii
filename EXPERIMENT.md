@@ -89,6 +89,58 @@ wgpu-gameui = { git = "...", default-features = false, features = ["bundled-font
 绑成局部变量，让编译器看见"这些是不同字段"。最后 UI 里不直接改状态，
 只往 `Actions` 结构里记标记，帧末统一 `apply_actions()`。
 
+### 3.7 `textureSample` 不能放在非 uniform 的分支里
+
+预览 shader 第一版是这样写的：
+
+```wgsl
+if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
+    let t = textureSample(frame_tex, frame_samp, uv);
+    ...
+}
+```
+
+`cargo check` 过、`cargo test` 过、wasm 也构建出来了，但一打开页面整块预览区全黑，
+console 里是：
+
+```text
+error: 'textureSample' must only be called from uniform control flow
+note: control flow depends on possibly non-uniform value
+note: builtin 'frag' of 'fs' may be non-uniform
+[Invalid ShaderModule "sii preview shader"] is invalid due to a previous error.
+[Invalid RenderPipeline "sii preview pipeline"] is invalid due to a previous error.
+```
+
+原因：`textureSample` 要隐式求导来选 mip level，WGSL 规范要求它必须处于
+uniform control flow。而"这个像素在不在图像内"依赖 `frag` 坐标，天生非 uniform。
+
+**修法**：换成显式指定 level 的 `textureSampleLevel(tex, samp, uv, 0.0)`。
+本项目所有纹理都只有一级 mip（`mip_level_count: 1`），采样结果与 `textureSample`
+完全一致，但不受控制流约束。顺便把 uv clamp 到 `[0,1]`，用 `select` 决定 alpha：
+
+```wgsl
+let inside = uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+let t = textureSampleLevel(frame_tex, frame_samp, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+let a = select(0.0, t.a, inside);
+```
+
+**更值得记的是这个坑怎么才不会再犯。** 一开始想用 naga（wgpu 自己的 WGSL 前端）
+在 `cargo test` 里校验 shader，结果发现它拦不住 —— naga 30 的 `valid/analyzer.rs` 里有
+
+```rust
+const DISABLE_UNIFORMITY_REQ_FOR_FRAGMENT_STAGE: bool = true;
+```
+
+主动关掉了 fragment 阶段的 uniformity 检查。拿旧 shader 去跑 naga 的 validator，
+一声不吭 —— **浏览器报错的东西，naga 不报**。
+
+最后落成一个源码级 lint 测试：shader 里不允许出现 `textureSample(` /
+`textureSampleBias(` / `textureSampleCompare(`，必须写显式 level 的版本。
+反向验证过 —— 把旧写法放回去，测试会准确报出第 48 行。
+
+教训：**"编译通过"和"能跑"之间隔着 GPU 驱动那一层。** 纯 CPU 侧的测试覆盖不到
+shader 语义，这类错误只能靠规范知识 + 源码级约束兜。
+
 ## 4. 实测数据
 
 Node 22 里加载真实 wasm（不是 mock），`performance.now()` 在外部计时：
@@ -116,9 +168,10 @@ Node 22 里加载真实 wasm（不是 mock），`performance.now()` 在外部计
 | Worker 编码 | 20.5 ms | 1481 ms |
 | **主线程实际阻塞** | **≈0 ms** | **≈218 ms** |
 
-`cargo test` 有 10 个单元测试，跑在原生环境不需要浏览器，覆盖：
+`cargo test` 有 12 个单元测试，跑在原生环境不需要浏览器，覆盖：
 局部帧合成、disposal 语义、往返编解码、增删/翻转/裁剪/缩放、单帧保护、抽帧预算、
-快照往返、快照截断拒绝、"绕一圈快照再编码字节必须一致"。
+快照往返、快照截断拒绝、"绕一圈快照再编码字节必须一致"，以及两项 shader 检查
+（naga 解析校验 + 禁止隐式 LOD 采样，见 3.7）。
 
 ## 5. 三个关键判断
 
