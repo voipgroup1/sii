@@ -37,6 +37,18 @@
     animation: spin .8s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  #empty {
+    position: fixed;
+    /* 预览区中央：左边工具栏 190、右边面板 272、顶栏 52、底栏 104 */
+    left: calc(190px + (100vw - 462px) / 2);
+    top: calc(52px + (100vh - 156px) / 2);
+    transform: translate(-50%, -50%);
+    z-index: 5; pointer-events: none;
+    display: none; text-align: center;
+    color: #5a5a68; font-size: 14px; letter-spacing: .06em; line-height: 2;
+  }
+  #empty.on { display: block; }
+  #empty b { color: #8b8b99; font-weight: 500; }
   #drop {
     position: fixed; inset: 0; z-index: 30; display: none;
     align-items: center; justify-content: center;
@@ -58,6 +70,8 @@
 
 <div id="drop">松手就打开</div>
 
+<div id="empty">拖入 GIF 文件<br><b>或点左上角「打开 GIF」</b></div>
+
 <div id="boot">
   <div class="title">sii</div>
   <div class="spinner" id="boot-spin"></div>
@@ -78,11 +92,14 @@ const bootEl  = document.getElementById('boot');
 const bootMsg = document.getElementById('boot-msg');
 const bootSpin= document.getElementById('boot-spin');
 const dropEl  = document.getElementById('drop');
+const emptyEl = document.getElementById('empty');
 const fileEl  = document.getElementById('sii-file');
 
 function setBoot(msg, isErr = false) {
   bootMsg.textContent = msg;
   bootMsg.classList.toggle('err', isErr);
+  // 出错时要能把启动页重新叫回来（正常启动后它是隐藏的）
+  bootEl.classList.remove('hidden');
 }
 function hideBoot() { bootEl.classList.add('hidden'); }
 
@@ -221,6 +238,7 @@ async function openGifFile(file) {
     const summary = wasmApi.load_gif(new Uint8Array(buf));
     console.log('[sii]', summary);
     hideBoot();
+    emptyEl.classList.remove('on');
     // 顺手预热导出 Worker：第一次点"导出"就不用再等 wasm 实例化了
     setTimeout(() => { try { getExportWorker(); } catch {} }, 800);
   } catch (e) {
@@ -278,9 +296,11 @@ window.addEventListener('keydown', e => {
     await mod.default();
     wasmApi = mod;
     await mod.start('sii-canvas');
-    bootSpin.style.display = 'none';
-    setBoot('WebGPU 就绪 —— 点左上角「打开 GIF」，或者直接把文件拖进来');
-    // 留一行提示，不自动消失；打开文件后由 openGifFile 收掉
+    // 启动成功就直接收掉启动页。它盖住整个屏幕，留着的话左上角那个
+    // 「打开 GIF」按钮根本点不到 —— 用户只能看到一句"点左上角打开"，
+    // 然后发现左上角什么都没有。
+    hideBoot();
+    emptyEl.classList.add('on');
   } catch (e) {
     bootSpin.style.display = 'none';
     setBoot('初始化失败：\n' + (e?.stack || e?.message || e), true);
