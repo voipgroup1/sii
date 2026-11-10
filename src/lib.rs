@@ -71,6 +71,8 @@ struct App {
 
     status: String,
     duck_busy: bool,
+    /// 导出是否正在后台线程跑。为 true 时按钮变灰，避免重复提交。
+    exporting: bool,
 }
 
 impl App {
@@ -168,6 +170,7 @@ impl App {
             let sat = self.sat;
             let export_speed = self.export_speed;
             let duck_busy = self.duck_busy;
+            let exporting = self.exporting;
 
             Frame::new(ui_state, input, theme, &KeyboardNav)
                 .dt(dt)
@@ -192,6 +195,7 @@ impl App {
                             sat,
                             export_speed,
                             duck_busy,
+                            exporting,
                         },
                         &mut acts,
                     );
@@ -300,16 +304,18 @@ impl App {
         if acts.open {
             js_call0("openFile");
         }
-        if acts.export {
+        if acts.export && !self.exporting {
             match self.doc.as_ref() {
-                Some(doc) => match gifdoc::encode(doc, self.export_speed as i32) {
-                    Ok(bytes) => {
-                        let n = bytes.len();
-                        js_call_bytes("download", &bytes);
-                        self.status = format!("已导出 {:.1} KB", n as f32 / 1024.0);
-                    }
-                    Err(e) => self.status = format!("导出失败: {e}"),
-                },
+                Some(doc) => {
+                    // 主线程只做一次快照 memcpy，编码全部甩给 Worker
+                    let snap = gifdoc::snapshot(doc);
+                    let frames = doc.frames.len();
+                    let mb = snap.len() as f32 / (1024.0 * 1024.0);
+                    self.exporting = true;
+                    self.status =
+                        format!("导出中：{frames} 帧 / {mb:.1} MB 快照已交给后台线程…");
+                    js_call_export(&snap, self.export_speed as i32);
+                }
                 None => self.status = "还没有打开 GIF".into(),
             }
         }
@@ -527,6 +533,7 @@ struct UiView<'a> {
     sat: f32,
     export_speed: f32,
     duck_busy: bool,
+    exporting: bool,
 }
 
 /// 把局部光标挪到绝对坐标
@@ -545,7 +552,8 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
     x += 92.0;
 
     at(ui, x, 10.0);
-    if ui.text_button("导出 GIF", Some(84.0), Some(32.0)) {
+    let export_label = if v.exporting { "导出中…" } else { "导出 GIF" };
+    if ui.text_button(export_label, Some(84.0), Some(32.0)) && !v.exporting {
         a.export = true;
     }
     x += 92.0;
@@ -762,12 +770,30 @@ fn js_call0(name: &str) {
     }
 }
 
+#[allow(dead_code)]
 fn js_call_bytes(name: &str, bytes: &[u8]) {
     if let Some(ns) = js_ns() {
         if let Ok(f) = js_sys::Reflect::get(&ns, &JsValue::from_str(name)) {
             if f.is_function() {
                 let arr = js_sys::Uint8Array::from(bytes);
                 let _ = js_sys::Function::from(f).call1(&JsValue::NULL, &arr);
+            }
+        }
+    }
+}
+
+/// 把快照 + 质量参数交给 JS，由它转发给 Web Worker。
+/// 快照在 JS 侧会立刻被 transfer 走，所以不存在第二份副本。
+fn js_call_export(bytes: &[u8], speed: i32) {
+    if let Some(ns) = js_ns() {
+        if let Ok(f) = js_sys::Reflect::get(&ns, &JsValue::from_str("exportAsync")) {
+            if f.is_function() {
+                let arr = js_sys::Uint8Array::from(bytes);
+                let _ = js_sys::Function::from(f).call2(
+                    &JsValue::NULL,
+                    &arr,
+                    &JsValue::from_f64(speed as f64),
+                );
             }
         }
     }
@@ -851,6 +877,72 @@ pub fn export_gif(speed: i32) -> Result<Vec<u8>, JsValue> {
 pub fn transcode(bytes: &[u8], speed: i32) -> Result<Vec<u8>, JsValue> {
     let doc = gifdoc::decode(bytes).map_err(|e| JsValue::from_str(&e.0))?;
     gifdoc::encode(&doc, speed).map_err(|e| JsValue::from_str(&e.0))
+}
+
+/// 把文档写进一块 JS 堆上的 Uint8Array。
+///
+/// 不走 `Vec<u8>` 返回，是因为那样会变成两次 88 MB 拷贝
+/// （Rust 里建 Vec 一次，wasm-bindgen 再 slice 到 JS 堆一次）。
+/// 这里直接分配 JS 数组、逐段 copy_from，只有一次跨边界拷贝。
+fn write_snapshot_js(doc: &Doc) -> js_sys::Uint8Array {
+    let n = doc.frames.len();
+    let px = doc.width as usize * doc.height as usize * 4;
+    let total = 12 + n * 2 + n * px;
+    let out = js_sys::Uint8Array::new_with_length(total as u32);
+
+    let mut head = [0u8; 12];
+    head[0..4].copy_from_slice(&gifdoc::SNAPSHOT_MAGIC);
+    head[4..6].copy_from_slice(&doc.width.to_le_bytes());
+    head[6..8].copy_from_slice(&doc.height.to_le_bytes());
+    head[8..12].copy_from_slice(&(n as u32).to_le_bytes());
+    out.subarray(0, 12).copy_from(&head);
+
+    let mut off: u32 = 12;
+    for f in &doc.frames {
+        out.subarray(off, off + 2).copy_from(&f.delay_cs.to_le_bytes());
+        off += 2;
+    }
+    for f in &doc.frames {
+        let end = off + px as u32;
+        out.subarray(off, end).copy_from(&f.rgba);
+        off = end;
+    }
+    out
+}
+
+/// 把当前文档拍成可跨线程传输的快照，直接落在一块 JS 堆内存上。
+#[wasm_bindgen]
+pub fn snapshot() -> Option<js_sys::Uint8Array> {
+    APP.with(|a| {
+        let b = a.borrow();
+        b.as_ref()?.doc.as_ref().map(write_snapshot_js)
+    })
+}
+
+/// 纯函数：快照字节流 → GIF 字节。给 Web Worker 用，不依赖 UI / GPU / 全局状态。
+#[wasm_bindgen]
+pub fn encode_snapshot(buf: &[u8], speed: i32) -> Result<Vec<u8>, JsValue> {
+    let doc = gifdoc::from_snapshot(buf).map_err(|e| JsValue::from_str(&e.0))?;
+    gifdoc::encode(&doc, speed).map_err(|e| JsValue::from_str(&e.0))
+}
+
+/// 自检用：GIF 字节 → 快照。让 Node 里能单独验证快照往返，不需要 GPU。
+/// 走的是和 `snapshot()` 完全相同的写入路径，所以能反映真实开销。
+#[wasm_bindgen]
+pub fn snapshot_of(bytes: &[u8]) -> Result<js_sys::Uint8Array, JsValue> {
+    let doc = gifdoc::decode(bytes).map_err(|e| JsValue::from_str(&e.0))?;
+    Ok(write_snapshot_js(&doc))
+}
+
+/// Worker 回传结果：收尾导出状态，清掉按钮的灰态。
+#[wasm_bindgen]
+pub fn export_status(ok: bool, msg: String) {
+    APP.with(|a| {
+        if let Some(app) = a.borrow_mut().as_mut() {
+            app.exporting = false;
+            app.status = if ok { msg } else { format!("导出失败：{msg}") };
+        }
+    });
 }
 
 /// 键盘快捷键：由 index.html 转发进来
@@ -1006,6 +1098,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
         export_speed: 10.0,
         status: "就绪 —— 打开一个 GIF 开始".into(),
         duck_busy: false,
+        exporting: false,
     };
 
     APP.with(|a| *a.borrow_mut() = Some(app));

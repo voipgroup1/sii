@@ -125,6 +125,52 @@ const duck = {
   },
 };
 
+// ---------------------------------------------------------------- 导出 Worker
+//  重编码里最贵的是 NeuQuant 量化（800×600×48 帧实测 1.5 秒）。
+//  放到 Worker 后主线程一秒都不卡，代价只是第一次多一次 wasm 实例化。
+let wasmApi = null;
+
+let exportWorker = null;
+let exportSeq = 0;
+const exportPending = new Map();
+
+function getExportWorker() {
+  if (exportWorker) return exportWorker;
+  const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+
+  w.onmessage = (e) => {
+    const d = e.data || {};
+    if (d.phase === 'ready') return;          // 预热信号，不关任何人的事
+    const p = exportPending.get(d.id);
+    if (!p) return;
+    exportPending.delete(d.id);
+    if (d.ok) p.resolve(d.bytes);
+    else p.reject(new Error(d.error || '编码失败'));
+  };
+
+  // Worker 整体挂了（wasm 加载失败 / 语法错误）时，把所有等待中的任务一起失败掉，
+  // 否则状态栏会永远停在"导出中"。
+  w.onerror = (ev) => {
+    const msg = ev?.message || 'Worker 启动失败';
+    for (const [, p] of exportPending) p.reject(new Error(msg));
+    exportPending.clear();
+    try { w.terminate(); } catch {}
+    exportWorker = null;
+  };
+
+  exportWorker = w;
+  return w;
+}
+
+function encodeInWorker(snapshot, speed) {
+  const w = getExportWorker();
+  const id = ++exportSeq;
+  const p = new Promise((resolve, reject) => exportPending.set(id, { resolve, reject }));
+  // transfer 快照，主线程这边不留副本
+  w.postMessage({ id, type: 'encode', snapshot, speed }, [snapshot.buffer]);
+  return p;
+}
+
 // ---------------------------------------------------------------- 对外桥
 const current = { name: 'output.gif' };
 
@@ -144,11 +190,25 @@ window.__sii = {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
   },
+
+  /// wasm 把快照 + 质量参数丢过来，这里转给 Worker，编完直接落盘。
+  async exportAsync(snapshot, speed) {
+    const t0 = performance.now();
+    try {
+      const bytes = await encodeInWorker(snapshot, speed);
+      this.download(bytes);
+      const ms = Math.round(performance.now() - t0);
+      wasmApi?.export_status(
+        true,
+        `已导出 ${(bytes.byteLength / 1024).toFixed(1)} KB · 后台线程 ${ms} ms`
+      );
+    } catch (e) {
+      wasmApi?.export_status(false, String(e?.message ?? e));
+    }
+  },
 };
 
 // ---------------------------------------------------------------- 文件加载
-let wasmApi = null;
-
 async function openGifFile(file) {
   if (!file) return;
   if (!/\.gif$/i.test(file.name) && file.type !== 'image/gif') {
@@ -161,6 +221,8 @@ async function openGifFile(file) {
     const summary = wasmApi.load_gif(new Uint8Array(buf));
     console.log('[sii]', summary);
     hideBoot();
+    // 顺手预热导出 Worker：第一次点"导出"就不用再等 wasm 实例化了
+    setTimeout(() => { try { getExportWorker(); } catch {} }, 800);
   } catch (e) {
     setBoot('解码失败：' + (e?.message ?? e), true);
   }

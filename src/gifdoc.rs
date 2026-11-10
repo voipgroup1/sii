@@ -223,6 +223,83 @@ pub fn encode(doc: &Doc, speed: i32) -> Result<Vec<u8>, GifError> {
     Ok(out)
 }
 
+// ------------------------------------------------------------------ 跨线程快照
+
+/// 快照格式的魔数。改格式时连它一起改，旧 Worker 读到新字节流会直接报错而不是画出鬼东西。
+pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SII1";
+
+/// 把文档压成一条连续字节流，用于跨线程（Web Worker）传递。
+///
+/// ```text
+/// [0..4]    b"SII1"
+/// [4..6]    width      u16 LE
+/// [6..8]    height     u16 LE
+/// [8..12]   frame_cnt  u32 LE
+/// [12..]    delays     frame_cnt × u16 LE
+/// [..]      pixels     frame_cnt × width × height × 4  (RGBA8)
+/// ```
+///
+/// 为什么不用 serde / JSON：这个格式要过几十上百 MB 的像素，
+/// 任何字段名和分隔符都是纯浪费。定长头部 + 一块连续像素，
+/// 主线程只做一次 memcpy 就能把整个 ArrayBuffer transfer 出去。
+pub fn snapshot(doc: &Doc) -> Vec<u8> {
+    let n = doc.frames.len();
+    let px = doc.width as usize * doc.height as usize * 4;
+    let mut out = Vec::with_capacity(12 + n * 2 + n * px);
+    out.extend_from_slice(&SNAPSHOT_MAGIC);
+    out.extend_from_slice(&doc.width.to_le_bytes());
+    out.extend_from_slice(&doc.height.to_le_bytes());
+    out.extend_from_slice(&(n as u32).to_le_bytes());
+    for f in &doc.frames {
+        out.extend_from_slice(&f.delay_cs.to_le_bytes());
+    }
+    for f in &doc.frames {
+        out.extend_from_slice(&f.rgba);
+    }
+    out
+}
+
+/// 从快照字节流还原文档。长度对不上一律报错，不猜、不补齐。
+pub fn from_snapshot(buf: &[u8]) -> Result<Doc, GifError> {
+    if buf.len() < 12 {
+        return Err(GifError("快照太短".into()));
+    }
+    if buf[0..4] != SNAPSHOT_MAGIC {
+        return Err(GifError("快照魔数不对，可能是旧版本产物".into()));
+    }
+    let width = u16::from_le_bytes([buf[4], buf[5]]);
+    let height = u16::from_le_bytes([buf[6], buf[7]]);
+    let n = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+    if n == 0 {
+        return Err(GifError("快照里没有帧".into()));
+    }
+    let px = width as usize * height as usize * 4;
+    let delays_at = 12;
+    let pixels_at = delays_at + n * 2;
+    let need = pixels_at + n * px;
+    if buf.len() < need {
+        return Err(GifError(format!(
+            "快照长度不够：要 {need} 字节，实际 {}",
+            buf.len()
+        )));
+    }
+    let mut frames = Vec::with_capacity(n);
+    for i in 0..n {
+        let d = u16::from_le_bytes([buf[delays_at + i * 2], buf[delays_at + i * 2 + 1]]);
+        let off = pixels_at + i * px;
+        frames.push(Frame {
+            delay_cs: d,
+            rgba: buf[off..off + px].to_vec(),
+        });
+    }
+    Ok(Doc {
+        width,
+        height,
+        frames,
+        loop_infinite: true,
+    })
+}
+
 // ---------------------------------------------------------------- 编辑操作
 
 /// 编辑操作的错误
@@ -592,5 +669,42 @@ mod tests {
     #[test]
     fn empty_input_is_an_error() {
         assert!(decode(&[]).is_err());
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_every_frame() {
+        let doc = decode(&synth_gif()).unwrap();
+        let snap = snapshot(&doc);
+        // 12 字节头 + n×2 延迟 + n×w×h×4 像素
+        let px = doc.width as usize * doc.height as usize * 4;
+        assert_eq!(snap.len(), 12 + doc.frames.len() * 2 + doc.frames.len() * px);
+
+        let back = from_snapshot(&snap).unwrap();
+        assert_eq!((back.width, back.height), (doc.width, doc.height));
+        assert_eq!(back.frames.len(), doc.frames.len());
+        for (a, b) in doc.frames.iter().zip(back.frames.iter()) {
+            assert_eq!(a.delay_cs, b.delay_cs);
+            assert_eq!(a.rgba, b.rgba);
+        }
+    }
+
+    #[test]
+    fn snapshot_rejects_garbage_and_truncation() {
+        assert!(from_snapshot(&[]).is_err());
+        assert!(from_snapshot(b"NOPE").is_err());
+        assert!(from_snapshot(&[0u8; 40]).is_err());
+
+        let doc = decode(&synth_gif()).unwrap();
+        let mut snap = snapshot(&doc);
+        snap.truncate(snap.len() - 1);
+        assert!(from_snapshot(&snap).is_err(), "少一个字节也必须报错");
+    }
+
+    #[test]
+    fn snapshot_encode_matches_direct_encode() {
+        let doc = decode(&synth_gif()).unwrap();
+        let direct = encode(&doc, 10).unwrap();
+        let via_snap = encode(&from_snapshot(&snapshot(&doc)).unwrap(), 10).unwrap();
+        assert_eq!(direct, via_snap, "绕一圈快照再编码，字节必须完全一致");
     }
 }
