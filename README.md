@@ -2,7 +2,8 @@
 
 **纯前端、WebGPU 加速的 GIF 观看与编辑器。没有后端。**
 
-打开一个高清 GIF，逐帧看，改延迟、裁剪缩放、翻转调色，再导出成新的 GIF ——
+打开一个高清 GIF，逐帧看，改延迟、裁剪缩放、翻转调色，配一段音频对齐节奏，
+再导出成新的 GIF ——
 解码、合成、编辑、编码全在 WebAssembly 里完成，上屏走 WebGPU。
 
 UI 用 [`wgpu-gameui`](https://github.com/voipgroup1/wgpu-gameui) 手写即时模式界面，
@@ -36,13 +37,16 @@ GIF 播放器最容易做错的地方是**帧合成**。GIF 的每一帧可能�
 │    index.html                                                    │
 │      ├── File API 读字节  ─────────────► wasm: load_gif()         │
 │      ├── 帧快照 ──transfer──► Worker    wasm: snapshot()          │
+│      ├── 指针事件 → Float32Array ──────► wasm: input::sync()      │
+│      ├── AudioContext ────────────────► wasm: audio::time_ms()   │
 │      └── DuckDB-WASM (CDN, 懒加载) ◄─── wasm: duck::index_doc()   │
 │                                                                  │
 │    wasm (src/)                                                   │
 │      ├── gifdoc.rs  解码 / 合成 / 编辑 / 编码   ← 不依赖 GPU      │
 │      ├── canvas.rs  WebGPU 预览管线（纹理 + 棋盘格 + 采样器）      │
-│      ├── duck.rs    帧元数据 → DuckDB 表                          │
-│      ├── input.rs   DOM 事件 → wgpu-gameui InputState             │
+│      ├── duck.rs    帧元数据 / 音频对齐 → DuckDB 表                │
+│      ├── input.rs   JS 事件数组 → wgpu-gameui InputState          │
+│      ├── audio.rs   播放控制 + 声卡时钟                           │
 │      └── lib.rs     App / rAF 主循环 / 界面                        │
 │                                                                  │
 │  ┌──────────── Worker 线程（worker.js）────────────┐              │
@@ -67,6 +71,11 @@ GIF 播放器最容易做错的地方是**帧合成**。GIF 的每一帧可能�
 - **导出走 Worker，主线程只负责拍快照。** 帧像素压成一条定长头部的字节流
   （`SII1` + 宽高帧数 + 延迟表 + 连续 RGBA），`postMessage` 时 transfer 出去，
   Worker 里还原成 `Doc` 再编码。主线程不再被 1.5 秒的 NeuQuant 冻住。
+- **指针事件不跨 wasm 边界。** 所有 `pointermove` / `wheel` 只往一个
+  `Float32Array` 里写数，wasm 每帧读一次快照。1000 Hz 的游戏鼠标一秒上千次事件，
+  跨语言调用从 O(事件数) 降到 O(帧数)，也顺带避开了高频回调撞上渲染帧时的借用冲突。
+- **音频播放时，声卡时钟是唯一时间源。** `AudioContext.currentTime` 是硬件时钟，
+  和 `performance.now()` 会缓慢漂移；画面按绝对时间查帧表，不做累加，误差不累积。
 
 ## 跑起来
 
@@ -94,7 +103,7 @@ cargo run --bin mksample -- /tmp/hd.gif 800 600 48   # 800×600 / 48 帧
 
 ### 快捷键
 
-`空格` 播放/暂停 · `,` `.` 上一帧/下一帧 · `-` `=` 缩放 · `0` 适应窗口 · `Home` `End` 首/末帧
+`空格` 播放/暂停（有音频时走音频时钟） · `,` `.` 上一帧/下一帧 · `-` `=` 缩放 · `0` 适应窗口 · `Home` `End` 首/末帧
 
 ## 实测数据
 
@@ -120,7 +129,7 @@ release，`opt-level="s"` + thin LTO）：
 
 产物大小：3.5 MB wasm（wgpu + naga 占大头）。
 
-`cargo test` 有 10 个单元测试，覆盖解码合成、往返编解码、编辑操作、快照往返、
+`cargo test` 有 12 个单元测试，覆盖解码合成、往返编解码、编辑操作、快照往返、
 快照截断拒绝，以及"绕一圈快照再编码字节必须一致"。全部跑在原生环境，不需要浏览器。
 
 ## DuckDB 怎么进来的
@@ -146,6 +155,45 @@ SELECT round(mean_r/32)*32 AS r_bucket, count(*) FROM gif_frames GROUP BY 1 ORDE
 最长停顿 / 长停顿帧数 / 唯一帧数` 带回来显示在状态栏。
 
 DuckDB-WASM 走 CDN 懒加载，**不点按钮就不会下载那 30 MB**。
+
+## 音频：和画面严丝合缝
+
+可以给 GIF 配一段音频，只取其中 `[start_ms, end_ms)` 这一段来播。播放时画面跟着
+音频走 —— 不是"大概对齐"，是每一帧都按音频的绝对播放位置查表。
+
+三件事决定了它准：
+
+1. **时间源用 `AudioContext.currentTime`。** 那是声卡的硬件时钟，和
+   `performance.now()` 之间会缓慢漂移（晶振误差，几十 ppm 量级）。跑十分钟能攒出
+   一帧以上的错位，所以播放期间不能让两边各走各的。
+2. **查帧是纯函数，没有累加状态。** `Doc::frame_at_ms(t)` 里同一个 `t` 永远返回同一帧。
+   `play_acc += dt` 那种写法每一帧的舍入误差都会留在累加器里，越跑越偏。
+3. **截取交给浏览器。** `AudioBufferSourceNode.start(0, offset, duration)` 由音频线程
+   自己截尾，比在 JS 里 `setTimeout` 调 `stop()` 准得多。
+
+对齐参数（音频文件名、总长、起止毫秒）存进 DuckDB：
+
+```sql
+CREATE TABLE IF NOT EXISTS gif_audio (
+    gif_name VARCHAR, audio_name VARCHAR,
+    duration_ms INTEGER, start_ms INTEGER, end_ms INTEGER,
+    saved_at TIMESTAMP
+);
+```
+
+`end_ms = 0` 表示播到结尾。同一个 GIF + 同一段音频只保留最后一行 —— 这张表记的是
+"当前的对齐方案"，不是操作日志。
+
+DuckDB-WASM 跑的是内存实例，刷新就没了，所以同一份参数还会镜像到 localStorage。
+音频二进制本身不存：几 MB 直接撞 localStorage 的 5 MB 配额，只存"怎么配"，
+文件让用户重选一次。
+
+## 关于 OffscreenCanvas
+
+评估过，没做。渲染一帧不到 2 ms，而解码一次要 296 ms —— 把渲染搬进 Worker 的收益
+可以忽略，反而会让输入多一帧延迟（UI 布局和文档状态都在主线程，每次点击都要
+`postMessage` 过去）。真正该搬的是 `gifdoc::decode`：纯 CPU、输入字节输出像素、
+没有 UI 依赖，天然适合 Worker。要优化就往那个方向走。
 
 ## 已知边界
 

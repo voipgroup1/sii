@@ -3,6 +3,7 @@
 //! 没有后端。文件读取走浏览器 File API，解码/合成/编辑全在 wasm 里，
 //! 上屏走 WebGPU（wgpu + wgpu-gameui），导出在 wasm 里重新编码成 GIF 字节流。
 
+mod audio;
 mod canvas;
 mod duck;
 pub mod gifdoc;
@@ -73,6 +74,20 @@ struct App {
     duck_busy: bool,
     /// 导出是否正在后台线程跑。为 true 时按钮变灰，避免重复提交。
     exporting: bool,
+
+    // ---- 音频 ----
+    /// 打开的文件名，写 DuckDB 元数据时要带上
+    gif_name: String,
+    /// 音频文件名，空表示没加载
+    audio_name: String,
+    /// 音频总时长（毫秒）
+    audio_duration_ms: u32,
+    /// 播放区间起点，音频文件内的毫秒
+    audio_start_ms: u32,
+    /// 播放区间终点，0 表示播到结尾
+    audio_end_ms: u32,
+    /// 音频是否正在响。真值在 JS 侧，这里只是每帧同步过来给 UI 用。
+    audio_playing: bool,
 }
 
 impl App {
@@ -111,14 +126,26 @@ impl App {
         self.sync_surface();
 
         // ---- 播放推进 ----
+        // 音频在响的时候，声卡时钟是唯一权威：直接按绝对时间查帧，不做任何
+        // 累加，误差不累积。没音频（或已播完）就回落到 dt 累加，行为和以前一致。
+        let audio_t = audio::time_ms();
+        self.audio_playing = audio_t >= 0.0;
+
         if self.playing {
             if let Some(doc) = &self.doc {
                 if doc.frames.len() > 1 {
-                    let cur_delay = doc.frames[self.frame_idx].delay_ms().max(10) as f32;
-                    self.play_acc += dt * 1000.0;
-                    if self.play_acc >= cur_delay {
-                        self.play_acc -= cur_delay;
-                        self.frame_idx = (self.frame_idx + 1) % doc.frames.len();
+                    if audio_t >= 0.0 {
+                        // 音频文件内的绝对位置 - 截取起点 = GIF 时间轴上的位置
+                        let rel = audio_t - self.audio_start_ms as f64;
+                        self.frame_idx = doc.frame_at_ms(rel);
+                        self.play_acc = 0.0;
+                    } else {
+                        let cur_delay = doc.frames[self.frame_idx].delay_ms().max(10) as f32;
+                        self.play_acc += dt * 1000.0;
+                        if self.play_acc >= cur_delay {
+                            self.play_acc -= cur_delay;
+                            self.frame_idx = (self.frame_idx + 1) % doc.frames.len();
+                        }
                     }
                 }
             }
@@ -158,6 +185,9 @@ impl App {
             // 逐字段借用，绕开闭包对 self 的整体占用
             let ui_state = &mut self.ui_state;
             let input = &mut *self.input.borrow_mut();
+            // 每帧第一件事：把 JS 侧攒下的事件搬进来。必须在 Frame::run 之前，
+            // 否则 UI 读到的是上一帧的输入，点按钮会慢半拍。
+            input::sync(input);
             let theme = &self.theme;
             let doc = &self.doc;
             let frame_idx = self.frame_idx;
@@ -171,6 +201,13 @@ impl App {
             let export_speed = self.export_speed;
             let duck_busy = self.duck_busy;
             let exporting = self.exporting;
+            let gif_name = self.gif_name.as_str();
+            let audio_name = self.audio_name.as_str();
+            let audio_duration_ms = self.audio_duration_ms;
+            let audio_start_ms = self.audio_start_ms;
+            let audio_end_ms = self.audio_end_ms;
+            let audio_playing = self.audio_playing;
+            let audio_progress = audio::progress();
 
             Frame::new(ui_state, input, theme, &KeyboardNav)
                 .dt(dt)
@@ -196,6 +233,13 @@ impl App {
                             export_speed,
                             duck_busy,
                             exporting,
+                            gif_name,
+                            audio_name,
+                            audio_duration_ms,
+                            audio_start_ms,
+                            audio_end_ms,
+                            audio_playing,
+                            audio_progress,
                         },
                         &mut acts,
                     );
@@ -331,14 +375,33 @@ impl App {
             }
         }
         if acts.toggle_play {
-            self.playing = !self.playing;
-            self.play_acc = 0.0;
+            // 空格的含义随状态变：
+            //   音频在响     → 停（用户的第一反应就是"别响了"）
+            //   有音频没在响 → 走音频时钟播，画面和声音一起起来
+            //   没音频       → 老行为，纯画面播放
+            if self.audio_playing {
+                audio::stop();
+                self.audio_playing = false;
+                self.playing = false;
+            } else if self.audio_duration_ms > 0 {
+                let ok = audio::play(self.audio_start_ms, self.audio_end_ms);
+                self.playing = ok;
+                self.audio_playing = ok;
+                self.play_acc = 0.0;
+            } else {
+                self.playing = !self.playing;
+                self.play_acc = 0.0;
+            }
         }
+        // 手动切帧 / 拖时间轴时必须停音频，否则下一帧就被音频时钟拽回去了，
+        // 用户会觉得"拖不动"。
+        let mut manual_seek = false;
         if acts.prev {
             if let Some(doc) = &self.doc {
                 if !doc.frames.is_empty() {
                     self.frame_idx =
                         (self.frame_idx + doc.frames.len() - 1) % doc.frames.len();
+                    manual_seek = true;
                 }
             }
         }
@@ -346,11 +409,19 @@ impl App {
             if let Some(doc) = &self.doc {
                 if !doc.frames.is_empty() {
                     self.frame_idx = (self.frame_idx + 1) % doc.frames.len();
+                    manual_seek = true;
                 }
             }
         }
         if let Some(i) = acts.seek {
             self.frame_idx = i;
+            manual_seek = true;
+        }
+        if manual_seek {
+            if self.audio_playing {
+                audio::stop();
+                self.audio_playing = false;
+            }
             self.playing = false;
         }
         if acts.zoom_in {
@@ -384,6 +455,92 @@ impl App {
                     });
                 }
                 None => self.status = "还没有打开 GIF".into(),
+            }
+        }
+
+        // ---- 音频 ----
+        // 顺序有讲究：先处理"换音频"和"移除"，再处理滑块，最后才是播放和入库。
+        // 用户点"换一个音频"的那一帧，起止点应该保持原样（换的是曲子不是区间），
+        // 但总时长要等 JS 解码完才知道，走 `audio_loaded` 回调补上。
+        if acts.audio_pick {
+            js_call0("pickAudio");
+        }
+        if acts.audio_clear {
+            audio::stop();
+            duck::clear_audio_local();
+            self.audio_name.clear();
+            self.audio_duration_ms = 0;
+            self.audio_start_ms = 0;
+            self.audio_end_ms = 0;
+            self.audio_playing = false;
+            self.playing = false;
+            self.status = "音频已移除".into();
+        }
+
+        if self.audio_duration_ms > 0 {
+            let dur = self.audio_duration_ms as f32;
+            let s = acts.audio_start_ms.clamp(0.0, dur).round();
+            let mut e = acts.audio_end_ms.clamp(0.0, dur).round();
+            // 结束点只有两种合法值：0（播到结尾）或者严格大于起点。
+            // 用户把结束点拖到起点左边时归零，比硬夹成 s+1 更符合直觉 ——
+            // 拖到底就是"不截尾"。
+            if e > 0.0 && e <= s {
+                e = 0.0;
+            }
+            let changed = s as u32 != self.audio_start_ms || e as u32 != self.audio_end_ms;
+            self.audio_start_ms = s as u32;
+            self.audio_end_ms = e as u32;
+            // 播放中改了区间：立刻按新区间重开，否则画面还在跟旧区间走。
+            if changed && self.audio_playing {
+                let ok = audio::play(self.audio_start_ms, self.audio_end_ms);
+                if !ok {
+                    self.audio_playing = false;
+                    self.playing = false;
+                }
+            }
+        }
+
+        if acts.audio_play {
+            if self.audio_duration_ms == 0 {
+                self.status = "还没加载音频".into();
+            } else {
+                let ok = audio::play(self.audio_start_ms, self.audio_end_ms);
+                if ok {
+                    // 音频时钟从这一刻开始成为唯一时间源，累加器作废
+                    self.play_acc = 0.0;
+                    self.playing = true;
+                    self.audio_playing = true;
+                    self.status = "播放中，画面跟音频时钟走".into();
+                } else {
+                    self.status = "音频播不了：浏览器可能还没拿到用户手势".into();
+                }
+            }
+        }
+        if acts.audio_stop {
+            audio::stop();
+            self.audio_playing = false;
+            self.playing = false;
+            self.status = "已停止".into();
+        }
+        if acts.audio_save {
+            if self.audio_duration_ms == 0 {
+                self.status = "还没加载音频".into();
+            } else {
+                let gif = self.gif_name.clone();
+                let name = self.audio_name.clone();
+                let (dur, s, e) = (self.audio_duration_ms, self.audio_start_ms, self.audio_end_ms);
+                self.status = "正在把音频对齐参数写进 DuckDB…".into();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let res = duck::save_audio_meta(&gif, &name, dur, s, e).await;
+                    APP.with(|a| {
+                        if let Some(app) = a.borrow_mut().as_mut() {
+                            app.status = match res {
+                                Ok(s) => s,
+                                Err(e) => format!("写库失败: {e}"),
+                            };
+                        }
+                    });
+                });
             }
         }
 
@@ -524,6 +681,15 @@ struct Actions {
     sat: f32,
     export_speed: f32,
     op_duck_index: bool,
+
+    // ---- 音频 ----
+    audio_pick: bool,
+    audio_play: bool,
+    audio_stop: bool,
+    audio_clear: bool,
+    audio_save: bool,
+    audio_start_ms: f32,
+    audio_end_ms: f32,
 }
 
 struct UiView<'a> {
@@ -545,6 +711,13 @@ struct UiView<'a> {
     export_speed: f32,
     duck_busy: bool,
     exporting: bool,
+    gif_name: &'a str,
+    audio_name: &'a str,
+    audio_duration_ms: u32,
+    audio_start_ms: u32,
+    audio_end_ms: u32,
+    audio_playing: bool,
+    audio_progress: f32,
 }
 
 /// 把局部光标挪到绝对坐标
@@ -727,6 +900,102 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
         a.op_duck_index = true;
     }
 
+    // ---------------- 音频 ----------------
+    ry += 38.0;
+    at(ui, rx, ry);
+    ui.text("音频", Some(rw));
+    ry += 22.0;
+
+    if v.audio_duration_ms == 0 {
+        at(ui, rx, ry);
+        if ui.text_button("加载音频…", Some(rw), Some(26.0)) {
+            a.audio_pick = true;
+        }
+        ry += 30.0;
+        at(ui, rx, ry);
+        ui.text("mp3 / wav / ogg / m4a", Some(rw));
+    } else {
+        at(ui, rx, ry);
+        ui.text(&shorten(v.audio_name, 20), Some(rw));
+        ry += 20.0;
+        at(ui, rx, ry);
+        ui.text(&format!("总长 {} ms", v.audio_duration_ms), Some(rw));
+        ry += 20.0;
+        at(ui, rx, ry);
+        // 音频对齐是"哪段音频配哪个 GIF"，不把 GIF 名字亮出来，用户切了文件
+        // 之后根本不知道这条记录会存到谁头上。
+        let gif_label = if v.gif_name.is_empty() {
+            "配：（还没打开 GIF）".to_string()
+        } else {
+            format!("配：{}", shorten(v.gif_name, 14))
+        };
+        ui.text(&gif_label, Some(rw));
+        ry += 24.0;
+
+        at(ui, rx, ry);
+        ui.text("起始 (ms)", Some(rw));
+        ry += 20.0;
+        at(ui, rx, ry);
+        a.audio_start_ms = ui.slider(
+            7,
+            v.audio_start_ms as f32,
+            0.0,
+            v.audio_duration_ms as f32,
+            Some(rw),
+        );
+        ry += 28.0;
+
+        at(ui, rx, ry);
+        ui.text("结束 (ms，0 = 到结尾)", Some(rw));
+        ry += 20.0;
+        at(ui, rx, ry);
+        a.audio_end_ms = ui.slider(
+            8,
+            v.audio_end_ms as f32,
+            0.0,
+            v.audio_duration_ms as f32,
+            Some(rw),
+        );
+        ry += 24.0;
+        at(ui, rx, ry);
+        let end_label = if v.audio_end_ms == 0 {
+            v.audio_duration_ms
+        } else {
+            v.audio_end_ms
+        };
+        ui.text(&format!("播放 {} → {} ms", v.audio_start_ms, end_label), Some(rw));
+        ry += 26.0;
+
+        at(ui, rx, ry);
+        let play_label = if v.audio_playing { "停止音频" } else { "试听这一段" };
+        if ui.text_button(play_label, Some(rw), Some(26.0)) {
+            if v.audio_playing {
+                a.audio_stop = true;
+            } else {
+                a.audio_play = true;
+            }
+        }
+        ry += 32.0;
+        at(ui, rx, ry);
+        // 没在播时也占这一行，画 0 —— 否则按钮会随着播放状态上下跳
+        ui.progress_bar(if v.audio_playing { v.audio_progress } else { 0.0 }, Some(rw));
+        ry += 26.0;
+        at(ui, rx, ry);
+        if ui.text_button("存到 DuckDB", Some(rw), Some(26.0)) {
+            a.audio_save = true;
+        }
+        ry += 32.0;
+        at(ui, rx, ry);
+        if ui.text_button("换一个音频", Some(rw), Some(26.0)) {
+            a.audio_pick = true;
+        }
+        ry += 32.0;
+        at(ui, rx, ry);
+        if ui.text_button("移除音频", Some(rw), Some(26.0)) {
+            a.audio_clear = true;
+        }
+    }
+
     // ---------------- 底栏：时间轴 ----------------
     let by = v.vh - BOTTOM_H + 12.0;
     let bw = v.vw - 24.0;
@@ -761,6 +1030,15 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
 }
 
 // ------------------------------------------------------------------ JS 桥
+
+/// 右栏只有 248 px，长文件名直接画会被裁掉，看着像坏了。按字符数截断补省略号。
+fn shorten(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{head}…")
+}
 
 fn js_ns() -> Option<js_sys::Object> {
     let win = web_sys::window()?;
@@ -822,9 +1100,13 @@ pub fn on_load() {
 }
 
 /// 加载一份 GIF（字节由 JS 的 File API 读好传进来）。
+///
+/// `name` 是原始文件名，只用来写 DuckDB 元数据 —— 音频对齐记录是按
+/// 「哪个 GIF 配哪段音频」存的，没有名字就没法把两张表连起来。
+///
 /// 返回一行状态文字。
 #[wasm_bindgen]
-pub fn load_gif(bytes: &[u8]) -> Result<String, JsValue> {
+pub fn load_gif(bytes: &[u8], name: String) -> Result<String, JsValue> {
     let t0 = web_sys::window()
         .and_then(|w| w.performance())
         .map(|p| p.now())
@@ -850,11 +1132,18 @@ pub fn load_gif(bytes: &[u8]) -> Result<String, JsValue> {
     APP.with(|a| {
         if let Some(app) = a.borrow_mut().as_mut() {
             app.doc = Some(doc);
+            app.gif_name = name;
             app.frame_idx = 0;
             app.playing = false;
             app.play_acc = 0.0;
             app.zoom = 1.0;
             app.pan = [0.0, 0.0];
+            // 换了 GIF 就停掉音频：截取区间是「这段音频的哪一段」，
+            // 换画面之后原来的对齐关系已经没意义了，留着播只会让人困惑。
+            audio::stop();
+            app.audio_playing = false;
+            app.audio_start_ms = 0;
+            app.audio_end_ms = 0;
             app.delay_cs = app
                 .doc
                 .as_ref()
@@ -867,6 +1156,45 @@ pub fn load_gif(bytes: &[u8]) -> Result<String, JsValue> {
     });
 
     Ok(summary)
+}
+
+/// JS 侧解码完音频后回调这里，参数是一段 JSON：`{"name": "...", "durationMs": 12345}`。
+///
+/// 为什么走 JSON 而不是两个参数：以后要加采样率、声道数、波形摘要都不用改
+/// wasm 导出签名，JS 侧多塞字段就行。解析失败就当作没加载。
+#[wasm_bindgen]
+pub fn audio_loaded(meta: String) -> Result<(), JsValue> {
+    let v = js_sys::JSON::parse(&meta)?;
+    let name = js_sys::Reflect::get(&v, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|x| x.as_string())
+        .unwrap_or_default();
+    let dur = js_sys::Reflect::get(&v, &JsValue::from_str("durationMs"))
+        .ok()
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0)
+        .max(0.0) as u32;
+
+    if dur == 0 {
+        return Err(JsValue::from_str("音频时长为 0，解码可能失败"));
+    }
+
+    APP.with(|a| {
+        if let Some(app) = a.borrow_mut().as_mut() {
+            app.audio_name = name;
+            app.audio_duration_ms = dur;
+            // 换了音频总长就变了，旧区间可能越界。起点超了就归零，
+            // 终点一律归零（播到结尾）—— 新音频还没听过，先别截。
+            if app.audio_start_ms > dur {
+                app.audio_start_ms = 0;
+            }
+            app.audio_end_ms = 0;
+            app.audio_playing = false;
+            app.playing = false;
+            app.status = format!("音频就绪：{dur} ms");
+        }
+    });
+    Ok(())
 }
 
 /// 把当前文档编码成 GIF 字节，由 JS 落盘。
@@ -1086,11 +1414,18 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     let preview = canvas::Preview::new(&device, format, 1, 1);
 
     let input = Rc::new(RefCell::new(InputState::default()));
-    input::attach(&canvas, input.clone());
+    // 事件监听器全在 index.html 里，只往 `window.__siiInput` 这个 Float32Array
+    // 写数，一个 wasm 边界都不过。这里抓住它，之后每帧读一次快照。
+    // 拿不到只是指针交互失灵，画面照常渲染，所以不返回错误。
+    input::attach();
 
     let viewport = Rc::new(RefCell::new((vw, vh)));
 
-    let app = App {
+    // 上次存的对齐参数。音频二进制没法塞进 localStorage（几 MB 直接撞 5 MB
+    // 配额），所以这里只恢复「怎么配」，音频文件得用户重新选一次。
+    let saved_audio = duck::load_audio_local();
+
+    let mut app = App {
         surface,
         device,
         queue,
@@ -1120,7 +1455,21 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
         status: "就绪 —— 打开一个 GIF 开始".into(),
         duck_busy: false,
         exporting: false,
+        gif_name: String::new(),
+        audio_name: String::new(),
+        audio_duration_ms: 0,
+        audio_start_ms: 0,
+        audio_end_ms: 0,
+        audio_playing: false,
     };
+
+    if let Some((name, dur, start, end)) = saved_audio {
+        app.audio_name = name;
+        app.audio_duration_ms = dur;
+        app.audio_start_ms = start.min(dur);
+        app.audio_end_ms = end;
+        app.status = format!("已恢复上次的音频对齐参数（{dur} ms），重新加载音频后生效");
+    }
 
     APP.with(|a| *a.borrow_mut() = Some(app));
 

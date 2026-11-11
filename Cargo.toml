@@ -67,6 +67,7 @@ features = [
     "Request",
     "RequestInit",
     "Headers",
+    "Storage",
     "StorageManager",
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",

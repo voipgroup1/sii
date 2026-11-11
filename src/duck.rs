@@ -161,3 +161,104 @@ pub async fn index_doc(doc: &Doc) -> Result<String, String> {
 
     Ok(format!("DuckDB 已索引 {} 帧 → {report}", metas.len()))
 }
+
+// ---------------------------------------------------------------- 音频元数据
+
+//  localStorage 的四个键。用四个独立键而不是一个 JSON，是因为 wasm 侧没有
+//  serde，手写 JSON 解析比多调四次 localStorage 贵得多，还容易出错。
+const LS_NAME: &str = "sii.audio.name";
+const LS_DUR: &str = "sii.audio.dur";
+const LS_START: &str = "sii.audio.start";
+const LS_END: &str = "sii.audio.end";
+
+fn ls() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
+}
+
+/// SQL 字符串字面量里的单引号要写两遍。文件名带 `'` 完全可能
+/// （"It's a gif.gif"），不转义就是一条语法错误。
+fn esc(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+fn save_audio_local(name: &str, dur: u32, start: u32, end: u32) {
+    let Some(s) = ls() else { return };
+    let _ = s.set_item(LS_NAME, name);
+    let _ = s.set_item(LS_DUR, &dur.to_string());
+    let _ = s.set_item(LS_START, &start.to_string());
+    let _ = s.set_item(LS_END, &end.to_string());
+}
+
+/// 读回上次存下的音频对齐参数：`(文件名, 总时长 ms, 起始 ms, 结束 ms)`。
+pub fn load_audio_local() -> Option<(String, u32, u32, u32)> {
+    let s = ls()?;
+    let name = s.get_item(LS_NAME).ok().flatten()?;
+    let num = |k: &str| -> u32 {
+        s.get_item(k)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    Some((name, num(LS_DUR), num(LS_START), num(LS_END)))
+}
+
+pub fn clear_audio_local() {
+    let Some(s) = ls() else { return };
+    for k in [LS_NAME, LS_DUR, LS_START, LS_END] {
+        let _ = s.remove_item(k);
+    }
+}
+
+/// 把音频对齐参数写进 DuckDB，同时镜像一份到 localStorage。
+///
+/// 为什么两边都要写：DuckDB-WASM 跑的是内存实例，刷新就没了，而用户辛苦调出来的
+/// 起止点不该丢；localStorage 则没法用 SQL 查（"哪段音频配哪个 GIF""平均截取多长"
+/// 这类问题才是把它放进关系库的理由）。先写 localStorage —— 那一步不依赖网络，
+/// DuckDB 的 wasm 还没下完也不会丢数据。
+pub async fn save_audio_meta(
+    gif_name: &str,
+    audio_name: &str,
+    duration_ms: u32,
+    start_ms: u32,
+    end_ms: u32,
+) -> Result<String, String> {
+    save_audio_local(audio_name, duration_ms, start_ms, end_ms);
+
+    init().await?;
+
+    let ddl = "CREATE TABLE IF NOT EXISTS gif_audio (
+        gif_name VARCHAR,
+        audio_name VARCHAR,
+        duration_ms INTEGER,
+        start_ms INTEGER,
+        end_ms INTEGER,
+        saved_at TIMESTAMP
+    )";
+    call(duck_exec_js(ddl)).await?;
+
+    // 同一个 GIF 配同一段音频只保留最后一行。这张表记的是"当前的对齐方案"，
+    // 不是操作日志 —— 不删的话调十次起止点就留十行垃圾，查起来还得自己挑最新。
+    let del = format!(
+        "DELETE FROM gif_audio WHERE gif_name='{}' AND audio_name='{}'",
+        esc(gif_name),
+        esc(audio_name)
+    );
+    call(duck_exec_js(&del)).await?;
+
+    let sql = format!(
+        "INSERT INTO gif_audio VALUES ('{}','{}',{},{},{},now())",
+        esc(gif_name),
+        esc(audio_name),
+        duration_ms,
+        start_ms,
+        end_ms
+    );
+    call(duck_exec_js(&sql)).await?;
+
+    let end_label = if end_ms == 0 { duration_ms } else { end_ms };
+    Ok(format!(
+        "音频对齐已入库：{audio_name} {}–{} ms（共 {} ms）",
+        start_ms, end_label, duration_ms
+    ))
+}

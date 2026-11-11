@@ -204,6 +204,127 @@ wasm 并行下载，wasm 里那次 fetch 就命中缓存了。
 字体"和"让 UI 用上它"是两件事：前者是 `load_font_bytes`，后者是
 `set_sans_serif_family`。只做前者，中文照样是豆腐块。
 
+### 3.10 输入事件：从「每次事件一次 wasm 调用」到「每帧读一次数组」
+
+最初的做法是每个 DOM 事件注册一个 `Closure`，事件一来就调进 wasm：
+
+```rust
+canvas.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())?;
+```
+
+问题不在功能，在量级。1000 Hz 的游戏鼠标一秒能打出上千次 `mousemove`，
+每次都是一次跨语言调用：参数封送、栈切换、`RefCell::borrow_mut()`。60 fps
+下真正需要的信息只有 60 份，剩下 940 次全是白烧。更糟的是 `borrow_mut()`
+撞上正在渲染的帧会 panic —— 高频事件下这是真实存在的风险。
+
+改成「事件写数组、每帧读一次」：
+
+```js
+// index.html
+const IN = new Float32Array(16);
+window.__siiInput = IN;
+canvasEl.addEventListener('pointermove', e => {
+  const r = canvasEl.getBoundingClientRect();
+  IN[0] = e.clientX - r.left;   // x
+  IN[1] = e.clientY - r.top;    // y
+});
+```
+
+```rust
+// input.rs
+pub fn sync(st: &mut InputState) {
+    let v = arr.to_vec();          // 一次 64 字节，拿到一致快照
+    st.mouse_x = v[I_X];
+    st.mouse_y = v[I_Y];
+    // ...
+    for i in I_CLICK..=I_DRAGGING { arr.set_index(i, 0.0); }  // 边沿清零
+}
+```
+
+三个容易踩的点：
+
+1. **`to_vec()` 而不是逐个 `Reflect::get`。** 前者一次读完，后者要 16 次属性
+   查找，还可能在读到一半时被事件改掉，拿到的不是一个时刻的状态。
+2. **边沿和增量必须读完清零。** `clicked` / `released` / `scroll_delta` 表达的
+   是「这一帧发生的事」，不清零下一帧会重复触发 —— 表现是点一下按钮触发两次。
+   而 `mouse_down` 是持续状态，不能清。
+3. **坐标必须是 CSS 逻辑像素，不能乘 `devicePixelRatio`。** UI 布局用的是逻辑
+   像素，喂物理像素进去所有点击都会偏移到右下角。
+
+顺带解决了指针跑出画布的问题：`setPointerCapture(e.pointerId)` 之后指针划出
+canvas 也继续收事件，否则松手收不到，`mouse_down` 永远卡在 1，界面像粘住了。
+
+### 3.11 要不要上 OffscreenCanvas：评估过，不做
+
+`OffscreenCanvas` 能把渲染搬到 Worker，主线程彻底解放。对游戏、对可视化大屏
+都是好选择，但对这个编辑器不合适：
+
+1. **瓶颈根本不在渲染。** 实测 800×600 / 48 帧的 GIF，渲染一帧不到 2 ms，
+   而解码一次要 296 ms。把 2 ms 搬到 Worker，收益可以忽略。
+2. **搬过去会让输入多一帧延迟。** UI 布局（`Frame::run` + `build_ui`）依赖
+   `InputState` 和文档状态，全在主线程。搬进 Worker 后每次点击都要
+   `postMessage` 过去，编辑器的手感会明显变钝 —— 这是倒退。
+3. **`wgpu-gameui` 的 `UiRenderer` 不是为跨线程设计的。** 它持有 GPU 资源句柄和
+   `FontSystemHandle`（`Arc<Mutex<...>>`），跨 Worker 共享要么复制状态、要么
+   全程加锁，复杂度远超收益。
+4. **真正该搬的是解码。** `gifdoc::decode` 是纯 CPU 计算，输入是字节、输出是
+   像素，没有 UI 依赖，天然适合放进 Worker。要做优化，方向在这里。
+
+结论：OffscreenCanvas 留给「渲染本身变重」的那天（比如加了滤镜链、多了实时
+合成层）。现在做，是把复杂度花在了不痛的地方。
+
+### 3.12 音频和 GIF 的时间同步
+
+难点不是"放声音"，是"放声音的同时让画面跟得上，而且跑十分钟不跑偏"。
+
+**时间源只有一个：`AudioContext.currentTime`。**
+
+它是声卡的硬件时钟，和 `performance.now()` 之间会缓慢漂移（晶振误差，几十 ppm
+量级）。跑一分钟差几毫秒，跑十分钟就能攒出一帧以上的错位。所以播放期间不能
+两边各走各的，必须让画面跟着音频走。
+
+**查帧用绝对时间，不做累加。**
+
+```rust
+// 音频文件内的绝对位置 - 截取起点 = GIF 时间轴上的位置
+let rel = audio::time_ms() - self.audio_start_ms as f64;
+self.frame_idx = doc.frame_at_ms(rel);
+```
+
+`frame_at_ms` 是个纯函数：同一个 `t` 永远返回同一帧，内部没有任何状态。这正是
+不漂移的关键 —— 主循环里 `play_acc += dt` 的写法，每一帧的舍入误差都会留在
+累加器里，越跑越偏；直接查表则误差不累积，第 1 秒和第 10 分钟一样准。
+
+帧延迟用 `max(10)` 兜底，和自由播放一致。GIF 允许写 0 延迟，但真按 0 算会
+一瞬间跑完一整轮。`rem_euclid` 而不是 `%`：音频刚起步时 `rel` 可能是负数，
+`%` 会返回负值。
+
+**截取区间交给浏览器。**
+
+```js
+src.start(0, s / 1000, (e - s) / 1000);   // 立即播、从第 s 秒起、播 e-s 秒
+```
+
+让 `AudioBufferSourceNode` 自己截尾，比在 JS 里 `setTimeout` 调 `stop()` 准得多
+—— 后者要跟渲染抢主线程，晚个几十毫秒很正常。
+
+**元数据进 DuckDB，同时镜像一份到 localStorage。**
+
+```sql
+CREATE OR REPLACE TABLE gif_audio (
+    gif_name VARCHAR, audio_name VARCHAR,
+    duration_ms INTEGER, start_ms INTEGER, end_ms INTEGER,
+    saved_at TIMESTAMP
+);
+```
+
+DuckDB-WASM 跑的是内存实例，刷新就没了；而用户辛苦调出来的起止点不该丢。
+localStorage 那份负责持久化，DuckDB 那份负责可查询（"哪段音频配哪个 GIF"
+"平均截取多长"这类问题才是把它放进关系库的理由）。音频二进制本身不存 ——
+几 MB 直接撞 localStorage 的 5 MB 配额，只存"怎么配"，文件让用户重选一次。
+
+`end_ms = 0` 表示播到结尾，比存一个等于 `duration_ms` 的绝对值更能表达"没截尾"。
+
 ## 4. 实测数据
 
 Node 22 里加载真实 wasm（不是 mock），`performance.now()` 在外部计时：

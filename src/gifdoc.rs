@@ -75,6 +75,40 @@ impl Doc {
         }
         self.frames.len() as f32 * 1000.0 / t as f32
     }
+
+    /// 按时间轴（毫秒）查出这一时刻该显示第几帧。
+    ///
+    /// 音频驱动播放时每帧都要调，所以这里**不能有任何累加状态** —— 传入的是
+    /// 绝对时间，同一个 t 永远返回同一帧。这正是"音画不漂移"的关键：主循环
+    /// 里用 dt 累加的做法，每一帧的舍入误差都会留在 `play_acc` 里，跑几分钟
+    /// 就能肉眼看出错位；直接查表则误差不累积。
+    ///
+    /// 超出总时长按循环折回。帧延迟用 `max(10)` 兜底，和自由播放一致 ——
+    /// GIF 允许写 0 延迟，但真按 0 算会一瞬间跑完一整轮。
+    pub fn frame_at_ms(&self, ms: f64) -> usize {
+        let n = self.frames.len();
+        if n <= 1 {
+            return 0;
+        }
+        let total: f64 = self
+            .frames
+            .iter()
+            .map(|f| f.delay_ms().max(10) as f64)
+            .sum();
+        if total <= 0.0 {
+            return 0;
+        }
+        // rem_euclid 而不是 %：音频刚起步时 ms 可能是负数，`%` 会给出负值
+        let mut t = ms.rem_euclid(total);
+        for (i, f) in self.frames.iter().enumerate() {
+            let d = f.delay_ms().max(10) as f64;
+            if t < d {
+                return i;
+            }
+            t -= d;
+        }
+        n - 1
+    }
 }
 
 // ---------------------------------------------------------------- 解码

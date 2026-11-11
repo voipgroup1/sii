@@ -70,6 +70,7 @@
 <canvas id="sii-canvas"></canvas>
 
 <input id="sii-file" type="file" accept="image/gif,image/*" hidden>
+<input id="sii-audio" type="file" accept="audio/*" hidden>
 
 <div id="drop">松手就打开</div>
 
@@ -97,6 +98,7 @@ const bootSpin= document.getElementById('boot-spin');
 const dropEl  = document.getElementById('drop');
 const emptyEl = document.getElementById('empty');
 const fileEl  = document.getElementById('sii-file');
+const audioEl = document.getElementById('sii-audio');
 
 function setBoot(msg, isErr = false) {
   bootMsg.textContent = msg;
@@ -105,6 +107,65 @@ function setBoot(msg, isErr = false) {
   bootEl.classList.remove('hidden');
 }
 function hideBoot() { bootEl.classList.add('hidden'); }
+
+// ---------------------------------------------------------------- 输入缓冲
+//  所有指针事件只往这个 Float32Array 里写数，一个 wasm 边界都不过。wasm 每帧
+//  读一次快照（见 src/input.rs），跨语言调用从 O(事件数) 降到 O(帧数) ——
+//  1000 Hz 的游戏鼠标一秒上千次 mousemove，以前就是上千次 wasm 调用。
+//
+//  槽位必须和 input.rs 里的 I_* 常量一一对应，改一边就得改另一边。
+//  末尾留了空位，加字段不用重新分配。
+const IN = new Float32Array(16);
+const I_X = 0, I_Y = 1;
+const I_DOWN = 2, I_RDOWN = 3, I_MDOWN = 4;
+const I_CLICK = 5, I_RCLICK = 6, I_MCLICK = 7;
+const I_RELEASE = 8, I_RRELEASE = 9, I_MRELEASE = 10;
+const I_SCROLL = 11;
+// 12/13/14 是拖拽增量，留给以后用：现在 is_dragging / drag_delta 由 wasm 里的
+// DragTracker 自己从 down/clicked/released 推，不用 JS 喂。
+window.__siiInput = IN;
+
+const canvasEl = document.getElementById('sii-canvas');
+
+function localXY(e) {
+  const r = canvasEl.getBoundingClientRect();
+  // UI 布局用的是 CSS 逻辑像素，这里不能乘 devicePixelRatio
+  IN[I_X] = e.clientX - r.left;
+  IN[I_Y] = e.clientY - r.top;
+}
+
+canvasEl.addEventListener('pointerdown', e => {
+  localXY(e);
+  // 拖拽时指针划出画布也要继续收事件，否则松手收不到、mouse_down 永远卡在 1
+  try { canvasEl.setPointerCapture(e.pointerId); } catch {}
+  if (e.button === 0) { IN[I_DOWN] = 1; IN[I_CLICK] = 1; }
+  else if (e.button === 2) { IN[I_RDOWN] = 1; IN[I_RCLICK] = 1; }
+  else if (e.button === 1) { IN[I_MDOWN] = 1; IN[I_MCLICK] = 1; }
+  e.preventDefault();
+});
+
+canvasEl.addEventListener('pointermove', e => localXY(e));
+
+canvasEl.addEventListener('pointerup', e => {
+  localXY(e);
+  if (e.button === 0) { IN[I_DOWN] = 0; IN[I_RELEASE] = 1; }
+  else if (e.button === 2) { IN[I_RDOWN] = 0; IN[I_RRELEASE] = 1; }
+  else if (e.button === 1) { IN[I_MDOWN] = 0; IN[I_MRELEASE] = 1; }
+});
+
+// 系统抢走指针（切窗口、来电、手势冲突）时补一次松手，不然按钮会卡在按下态
+canvasEl.addEventListener('pointercancel', () => {
+  IN[I_DOWN] = 0; IN[I_RDOWN] = 0; IN[I_MDOWN] = 0;
+});
+
+canvasEl.addEventListener('wheel', e => {
+  // 归一化成"格"：不同设备 deltaY 从 1 到 100+ 不等，除 100 让触控板和
+  // 鼠标滚轮手感接近。wasm 每帧读完清零，所以这里是累加。
+  IN[I_SCROLL] += e.deltaY / 100;
+  e.preventDefault();
+}, { passive: false });
+
+canvasEl.addEventListener('contextmenu', e => e.preventDefault());
 
 // ---------------------------------------------------------------- DuckDB 桥
 const duck = {
@@ -191,11 +252,128 @@ function encodeInWorker(snapshot, speed) {
   return p;
 }
 
+// ---------------------------------------------------------------- 音频
+//  和画面的同步靠一件事：播放期间以 AudioContext.currentTime 为唯一时间源。
+//  那是声卡的硬件时钟，和 performance.now() 之间会缓慢漂移（晶振误差，几十
+//  ppm 量级）—— 跑十分钟能攒出一帧以上的错位。所以 wasm 每帧问一次"现在播到
+//  第几毫秒"，直接按绝对时间查帧表，不做任何累加，误差不累积。
+const audio = {
+  ctx: null,
+  buffer: null,
+  node: null,
+  startedAt: 0,   // 起播时刻的 ctx.currentTime
+  startMs: 0,     // 音频文件内的起点
+  endMs: 0,
+  playing: false,
+  name: '',
+  durationMs: 0,
+
+  ctxOrCreate() {
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      this.ctx = new AC();
+    }
+    // 没拿到用户手势之前浏览器会把 AudioContext 挂成 suspended
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+    return this.ctx;
+  },
+
+  async load(file) {
+    const ctx = this.ctxOrCreate();
+    const raw = await file.arrayBuffer();
+    // 老 Safari 只支持回调形式；promise 形式同时传回调会抛 TypeError，
+    // 所以两条路都接上，谁先回谁算。
+    const decoded = await new Promise((resolve, reject) => {
+      const p = ctx.decodeAudioData(raw, resolve, reject);
+      if (p && typeof p.then === 'function') p.then(resolve, reject);
+    });
+    this.stop();
+    this.buffer = decoded;
+    this.name = file.name;
+    this.durationMs = Math.round(decoded.duration * 1000);
+    return this.durationMs;
+  },
+
+  /// 播 [startMs, endMs)；endMs 为 0 表示播到结尾。返回 false 表示放不了。
+  play(startMs, endMs) {
+    if (!this.buffer) return false;
+    const ctx = this.ctxOrCreate();
+    this.stop();
+
+    const dur = this.durationMs;
+    const s = Math.max(0, Math.min(Math.round(startMs), dur));
+    const e = endMs > 0 ? Math.min(Math.round(endMs), dur) : dur;
+    if (e <= s) return false;
+
+    const src = ctx.createBufferSource();
+    src.buffer = this.buffer;
+    src.connect(ctx.destination);
+    // 三个参数：何时开始（0 = 立即）、从音频的第几秒起、播多长。
+    // 让浏览器自己截尾，比在 JS 里定时 stop 准 —— 后者要跟渲染抢主线程。
+    src.start(0, s / 1000, (e - s) / 1000);
+
+    this.node = src;
+    this.startedAt = ctx.currentTime;
+    this.startMs = s;
+    this.endMs = e;
+    this.playing = true;
+
+    src.onended = () => {
+      if (this.node !== src) return;   // 已经被 stop 换掉了
+      this.node = null;
+      this.playing = false;
+    };
+    return true;
+  },
+
+  stop() {
+    if (this.node) {
+      try { this.node.onended = null; this.node.stop(); } catch {}
+      this.node = null;
+    }
+    this.playing = false;
+  },
+
+  /// 当前播到音频文件的第几毫秒；没在播返回 -1。
+  /// 这是文件内的绝对位置，含 startMs 偏移，调用方要减掉起点。
+  timeMs() {
+    if (!this.playing || !this.ctx) return -1;
+    return this.startMs + (this.ctx.currentTime - this.startedAt) * 1000;
+  },
+
+  progress() {
+    if (!this.playing) return 0;
+    const span = this.endMs - this.startMs;
+    if (span <= 0) return 0;
+    return Math.min(1, Math.max(0, (this.timeMs() - this.startMs) / span));
+  },
+};
+
+function pickAudio() { audioEl.click(); }
+
+audioEl.addEventListener('change', async () => {
+  const f = audioEl.files?.[0];
+  audioEl.value = '';
+  if (!f) return;
+  try {
+    const dur = await audio.load(f);
+    // 总时长只有解码完才知道，回填给 wasm 更新滑块范围
+    wasmApi?.audio_loaded(JSON.stringify({ name: f.name, durationMs: dur }));
+  } catch (e) {
+    console.error('[sii] 音频解码失败', e);
+    setBoot('音频解码失败：' + (e?.message ?? e), true);
+    setTimeout(hideBoot, 4000);
+  }
+});
+
 // ---------------------------------------------------------------- 对外桥
 const current = { name: 'output.gif' };
 
 window.__sii = {
   duck,
+  // wasm 里的 audio.rs 用 js_namespace = ["window","__sii","audio"] 调这几个方法
+  audio,
+  pickAudio,
 
   openFile() { fileEl.click(); },
 
@@ -238,7 +416,7 @@ async function openGifFile(file) {
   current.name = file.name;
   const buf = await file.arrayBuffer();
   try {
-    const summary = wasmApi.load_gif(new Uint8Array(buf));
+    const summary = wasmApi.load_gif(new Uint8Array(buf), file.name);
     console.log('[sii]', summary);
     hideBoot();
     emptyEl.classList.remove('on');
