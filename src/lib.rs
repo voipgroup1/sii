@@ -8,6 +8,7 @@ mod canvas;
 mod duck;
 pub mod gifdoc;
 mod input;
+mod viewport;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -47,7 +48,8 @@ struct App {
     theme: Theme,
     draw_list: Option<DrawList>,
     input: Rc<RefCell<InputState>>,
-    viewport: Rc<RefCell<(f32, f32)>>,
+    /// 画布尺寸。由 JS 侧 ResizeObserver 维护，每帧读一次缓存值。
+    size: viewport::Size,
 
     // 文档
     doc: Option<Doc>,
@@ -123,7 +125,15 @@ impl App {
         };
         self.last_time = now;
 
-        self.sync_surface();
+        // 尺寸只在 JS 侧真的变过之后才更新（ResizeObserver 驱动），这里读的是
+        // 缓存值。拿到新尺寸必须重配 surface，而且这一帧直接丢掉 —— 见
+        // sync_surface 的注释。
+        if let Some(s) = viewport::read() {
+            self.size = s;
+        }
+        if self.sync_surface() {
+            return;
+        }
 
         // ---- 播放推进 ----
         // 音频在响的时候，声卡时钟是唯一权威：直接按绝对时间查帧，不做任何
@@ -171,8 +181,9 @@ impl App {
         }
 
         // ---- 构建 UI ----
-        let (vw, vh) = *self.viewport.borrow();
-        let (vw, vh) = (vw.max(320.0), vh.max(240.0));
+        // 直接用真实逻辑尺寸，不兜底。兜底会让 rect_clip 和实际的帧缓冲对不上，
+        // 预览就画到屏幕外面去了。窗口小到放不下时由 pw/ph 各自兜底。
+        let (vw, vh) = (self.size.css_w, self.size.css_h);
         let px = LEFT_W;
         let py = TOP_H;
         let pw = (vw - LEFT_W - RIGHT_W).max(80.0);
@@ -217,10 +228,6 @@ impl App {
                         UiView {
                             vw,
                             vh,
-                            px,
-                            py,
-                            pw,
-                            ph,
                             doc,
                             frame_idx,
                             playing,
@@ -283,11 +290,7 @@ impl App {
         // 布局和交互状态，跟 GPU 缓冲区一点关系没有。
         self.ui.begin_frame();
 
-        let dpr = self.viewport.borrow().0;
-        let _ = dpr;
-        let scale = web_sys::window()
-            .map(|w| w.device_pixel_ratio() as f32)
-            .unwrap_or(1.0);
+        let scale = self.size.dpr;
 
         // 预览区域 → 裁剪空间
         let rect_clip = [
@@ -327,10 +330,8 @@ impl App {
             },
         );
 
-        let phys = (
-            (vw * scale).round().max(1.0) as u32,
-            (vh * scale).round().max(1.0) as u32,
-        );
+        // 必须和 config.width/height 同源，差一个像素就会每帧重配 surface
+        let phys = self.size.physical();
         if let Some(list) = &self.draw_list {
             self.ui
                 .render(&self.device, &self.queue, &mut encoder, &view, phys, scale, list);
@@ -341,18 +342,22 @@ impl App {
         drop(out);
     }
 
-    fn sync_surface(&mut self) {
-        let (vw, vh) = *self.viewport.borrow();
-        let scale = web_sys::window()
-            .map(|w| w.device_pixel_ratio() as f32)
-            .unwrap_or(1.0);
-        let w = (vw * scale).round().max(1.0) as u32;
-        let h = (vh * scale).round().max(1.0) as u32;
-        if w != self.config.width || h != self.config.height {
-            self.config.width = w;
-            self.config.height = h;
-            self.surface.configure(&self.device, &self.config);
+    /// 尺寸变了就重新配置 surface。返回 `true` 表示"这一帧别画"。
+    ///
+    /// **为什么必须跳过一帧**：`canvas.width` 赋值会让浏览器立刻重建 canvas 的
+    /// swapchain，而 wgpu 手里的 `SurfaceConfiguration` 还是旧的。从重配到第一
+    /// 张新纹理能稳定拿到之间有一次交接，这期间画上去的内容可能落在已经被丢弃
+    /// 的 buffer 上 —— 屏幕上就是旧帧残留叠着新内容，正是"resize 之后文字图形
+    /// 全糊在一起"的成因。跳一帧的成本是 16 ms 的静止画面，换的是绝不花屏。
+    fn sync_surface(&mut self) -> bool {
+        let (w, h) = self.size.physical();
+        if w == self.config.width && h == self.config.height {
+            return false;
         }
+        self.config.width = w;
+        self.config.height = h;
+        self.surface.configure(&self.device, &self.config);
+        true
     }
 
     fn apply_actions(&mut self, acts: Actions) {
@@ -695,10 +700,6 @@ struct Actions {
 struct UiView<'a> {
     vw: f32,
     vh: f32,
-    px: f32,
-    py: f32,
-    pw: f32,
-    ph: f32,
     doc: &'a Option<Doc>,
     frame_idx: usize,
     playing: bool,
@@ -1349,10 +1350,32 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
         .dyn_into()
         .map_err(|_| JsValue::from_str("元素不是 canvas"))?;
 
-    let vw = canvas.client_width().max(1) as f32;
-    let vh = canvas.client_height().max(1) as f32;
-    canvas.set_width((vw * win.device_pixel_ratio() as f32) as u32);
-    canvas.set_height((vh * win.device_pixel_ratio() as f32) as u32);
+    // 尺寸由 JS 侧的 ResizeObserver 维护在 window.__siiSize 里（见 index.html），
+    // 这里只抓住缓冲区、读一次初值。一个 DOM 查询都不做，也不碰 canvas 的
+    // width/height —— 那会重置绘图缓冲。
+    viewport::attach();
+    let size = match viewport::read() {
+        Some(s) => s,
+        None => {
+            // JS 侧没接上（脚本顺序错了、或者被 CSP 挡了）。量一次 DOM 兜底，
+            // 并把 canvas 的像素尺寸摆正 —— 它必须和 surface config 一致，
+            // 否则 configure 直接失败。
+            let dpr = win.device_pixel_ratio() as f32;
+            let dpr = if dpr > 0.0 { dpr } else { 1.0 };
+            let s = viewport::Size {
+                css_w: canvas.client_width().max(1) as f32,
+                css_h: canvas.client_height().max(1) as f32,
+                dpr,
+                gen: 0,
+            };
+            let (pw, ph) = s.physical();
+            canvas.set_width(pw);
+            canvas.set_height(ph);
+            log::warn!("尺寸桥没接上，退回启动时量一次 DOM");
+            s
+        }
+    };
+    let (init_w, init_h) = size.physical();
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let surface = instance
@@ -1391,8 +1414,8 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
-        width: (vw * win.device_pixel_ratio() as f32) as u32,
-        height: (vh * win.device_pixel_ratio() as f32) as u32,
+        width: init_w,
+        height: init_h,
         present_mode: wgpu::PresentMode::Fifo,
         desired_maximum_frame_latency: 2,
         alpha_mode: caps.alpha_modes[0],
@@ -1419,8 +1442,6 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     // 拿不到只是指针交互失灵，画面照常渲染，所以不返回错误。
     input::attach();
 
-    let viewport = Rc::new(RefCell::new((vw, vh)));
-
     // 上次存的对齐参数。音频二进制没法塞进 localStorage（几 MB 直接撞 5 MB
     // 配额），所以这里只恢复「怎么配」，音频文件得用户重新选一次。
     let saved_audio = duck::load_audio_local();
@@ -1436,7 +1457,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
         theme: Theme::default(),
         draw_list: Some(draw_list),
         input: input.clone(),
-        viewport: viewport.clone(),
+        size,
         doc: None,
         frame_idx: 0,
         playing: false,
@@ -1476,23 +1497,9 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     // ---- rAF 循环 ----
     let slot: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
     let slot2 = slot.clone();
-    let vp = viewport.clone();
     let closure = Closure::wrap(Box::new(move |t: f64| {
-        // 每帧同步画布尺寸（CSS 变了就跟着变）
-        if let Some(w) = web_sys::window() {
-            if let Some(d) = w.document() {
-                if let Some(e) = d.get_element_by_id("sii-canvas") {
-                    if let Ok(c) = e.dyn_into::<web_sys::HtmlCanvasElement>() {
-                        let nw = c.client_width().max(1) as f32;
-                        let nh = c.client_height().max(1) as f32;
-                        let dpr = w.device_pixel_ratio() as f32;
-                        c.set_width((nw * dpr) as u32);
-                        c.set_height((nh * dpr) as u32);
-                        *vp.borrow_mut() = (nw, nh);
-                    }
-                }
-            }
-        }
+        // 尺寸不在这里量 —— 见 viewport.rs。每帧读 clientWidth 会触发 forced
+        // reflow，每帧给 canvas.width 赋值会重建 swapchain，两件事都不能干。
         APP.with(|a| {
             if let Some(app) = a.borrow_mut().as_mut() {
                 app.frame(t);

@@ -39,6 +39,7 @@ GIF 播放器最容易做错的地方是**帧合成**。GIF 的每一帧可能�
 │      ├── 帧快照 ──transfer──► Worker    wasm: snapshot()          │
 │      ├── 指针事件 → Float32Array ──────► wasm: input::sync()      │
 │      ├── AudioContext ────────────────► wasm: audio::time_ms()   │
+│      ├── ResizeObserver → Float32Array ► wasm: viewport::read()  │
 │      └── DuckDB-WASM (CDN, 懒加载) ◄─── wasm: duck::index_doc()   │
 │                                                                  │
 │    wasm (src/)                                                   │
@@ -47,6 +48,7 @@ GIF 播放器最容易做错的地方是**帧合成**。GIF 的每一帧可能�
 │      ├── duck.rs    帧元数据 / 音频对齐 → DuckDB 表                │
 │      ├── input.rs   JS 事件数组 → wgpu-gameui InputState          │
 │      ├── audio.rs   播放控制 + 声卡时钟                           │
+│      ├── viewport.rs 画布尺寸缓存（ResizeObserver 驱动）           │
 │      └── lib.rs     App / rAF 主循环 / 界面                        │
 │                                                                  │
 │  ┌──────────── Worker 线程（worker.js）────────────┐              │
@@ -76,6 +78,10 @@ GIF 播放器最容易做错的地方是**帧合成**。GIF 的每一帧可能�
   跨语言调用从 O(事件数) 降到 O(帧数)，也顺带避开了高频回调撞上渲染帧时的借用冲突。
 - **音频播放时，声卡时钟是唯一时间源。** `AudioContext.currentTime` 是硬件时钟，
   和 `performance.now()` 会缓慢漂移；画面按绝对时间查帧表，不做累加，误差不累积。
+- **画布尺寸只在真的变了才动。** `ResizeObserver` 驱动，wasm 每帧只读缓存值。
+  每帧读 `clientWidth` 是 forced reflow，每帧给 `canvas.width` 赋值会重建
+  swapchain —— 两件事加起来就是「resize 之后又慢又叠」。尺寸变过的那一帧直接
+  丢掉，等新 swapchain 交接完再画。
 
 ## 跑起来
 

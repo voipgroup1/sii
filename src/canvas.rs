@@ -89,7 +89,6 @@ pub struct Preview {
     tex_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     texture: wgpu::Texture,
-    texture_view: wgpu::TextureView,
     tex_bg: wgpu::BindGroup,
     pub width: u32,
     pub height: u32,
@@ -170,7 +169,8 @@ impl Preview {
             ..Default::default()
         });
 
-        let (texture, texture_view, tex_bg) = Self::make_texture(device, &tex_bgl, &sampler, w, h);
+        // view 交给 bind group 持有（内部是 Arc），外面不用再留一份
+        let (texture, _view, tex_bg) = Self::make_texture(device, &tex_bgl, &sampler, w, h);
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sii preview layout"),
@@ -214,7 +214,6 @@ impl Preview {
             tex_bgl,
             sampler,
             texture,
-            texture_view,
             tex_bg,
             width: w,
             height: h,
@@ -267,9 +266,8 @@ impl Preview {
         if w == self.width && h == self.height {
             return;
         }
-        let (t, v, bg) = Self::make_texture(device, &self.tex_bgl, &self.sampler, w, h);
+        let (t, _view, bg) = Self::make_texture(device, &self.tex_bgl, &self.sampler, w, h);
         self.texture = t;
-        self.texture_view = v;
         self.tex_bg = bg;
         self.width = w;
         self.height = h;
@@ -346,10 +344,6 @@ impl Preview {
         pass.set_bind_group(0, &self.uniform_bg, &[]);
         pass.set_bind_group(1, &self.tex_bg, &[]);
         pass.draw(0..6, 0..1);
-    }
-
-    pub fn texture_view(&self) -> &wgpu::TextureView {
-        &self.texture_view
     }
 }
 

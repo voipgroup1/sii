@@ -325,6 +325,95 @@ localStorage 那份负责持久化，DuckDB 那份负责可查询（"哪段音�
 
 `end_ms = 0` 表示播到结尾，比存一个等于 `duration_ms` 的绝对值更能表达"没截尾"。
 
+### 3.13 画布尺寸：为什么不能每帧量
+
+症状：拖动窗口改变大小之后，文字和图形糊在一起互相叠着，播放也肉眼可见地变慢。
+
+三处叠加在一起：
+
+**一、rAF 里每帧读 `clientWidth`。**
+
+```rust
+let nw = c.client_width().max(1) as f32;   // ← 每帧一次 forced reflow
+```
+
+`clientWidth` / `getBoundingClientRect()` 是布局属性。读它们的时候浏览器必须
+确保布局是最新的 —— 如果有攒着的样式变更，就当场同步算一遍。一秒六十次，等于
+六十次同步布局，每一次都可能打断渲染管线。
+
+**二、rAF 里每帧给 `canvas.width` 赋值。**
+
+```rust
+c.set_width((nw * dpr) as u32);            // ← 每帧重置一次绘图缓冲
+c.set_height((nh * dpr) as u32);
+```
+
+这是最狠的一刀。`canvas.width = x` 会重置绘图缓冲，对 WebGPU canvas 来说就是让
+浏览器重建 swapchain。即使新旧值一样，这个 setter 也不保证是空操作 —— 各浏览器
+实现不一样，赌不起。
+
+更糟的是时序：`set_width` 在 rAF 回调里、`get_current_texture()` 之前跑。canvas
+的 swapchain 在这一刻被换掉了，而 wgpu 手里的 `SurfaceConfiguration` 还是旧的，
+这一帧拿到的纹理可能已经作废。画上去的结果就是**上一帧的残留叠着新内容** ——
+正是"文字图形重叠"。
+
+**三、两边算尺寸的取整方式不一样。**
+
+```rust
+// rAF 里：截断
+c.set_width((nw * dpr) as u32);
+// sync_surface 里：四舍五入
+let w = (vw * scale).round().max(1.0) as u32;
+```
+
+`1599.6` 一个得 1599、一个得 1600。只要差一个像素，`sync_surface` 就每帧都判定
+"尺寸变了"，每帧 `configure` 一次 —— 又是每帧一次 swapchain 重建。
+
+**修法：尺寸变成"变了才动"的事件，而不是"每帧确认"的轮询。**
+
+JS 侧用 `ResizeObserver`：
+
+```js
+const SIZE = new Float32Array(4);   // [cssW, cssH, dpr, gen]
+window.__siiSize = SIZE;
+
+function applySize() {
+  const r = canvasEl.getBoundingClientRect();
+  const pw = Math.max(1, Math.round(r.width  * dpr));
+  const ph = Math.max(1, Math.round(r.height * dpr));
+  if (canvasEl.width  !== pw) canvasEl.width  = pw;   // ← 变了才碰
+  if (canvasEl.height !== ph) canvasEl.height = ph;
+  if (SIZE[0] !== r.width || SIZE[1] !== r.height || SIZE[2] !== dpr) {
+    SIZE[0] = r.width; SIZE[1] = r.height; SIZE[2] = dpr;
+    SIZE[3] += 1;                                     // 版本号
+  }
+}
+new ResizeObserver(applySize).observe(canvasEl);
+window.addEventListener('resize', applySize);
+```
+
+wasm 侧（`src/viewport.rs`）每帧只读这四个数，一个 DOM 查询都不做：
+
+```rust
+if let Some(s) = viewport::read() {
+    self.size = s;
+}
+if self.sync_surface() {   // 尺寸变了就重配 surface，返回 true
+    return;                // ← 这一帧丢掉
+}
+```
+
+**为什么必须丢掉一帧**：从 `configure` 到第一张新纹理能稳定拿到之间有一次交接。
+这期间画上去的内容可能落在已经被丢弃的 buffer 上。16 ms 的静止画面换绝不花屏，
+划算。
+
+**顺带修掉的**：`physical()` 现在只有一处实现，`config.width/height` 和传给
+`UiRenderer::render` 的尺寸都从它来，再也不可能对不上。
+
+还有个隐性的坑：原来 UI 布局对 `vw/vh` 做了 `max(320.0)` / `max(240.0)` 兜底，
+但 `config` 用的是没兜底的值。窗口小于 320 时两者不一致，`rect_clip` 算出来会
+超出屏幕。现在不兜底了，小窗口由 `pw/ph` 各自兜底。
+
 ## 4. 实测数据
 
 Node 22 里加载真实 wasm（不是 mock），`performance.now()` 在外部计时：
