@@ -192,6 +192,17 @@ impl App {
         let mut acts = Actions::default();
 
         let mut list = self.draw_list.take().expect("draw list 被吃了");
+        // 每帧必须先清空几何，只保留字形/测量缓存和列表 identity。
+        //
+        // `Frame::run` 只往 DrawList 里追加，不会替你清；而这个列表是跨帧复用
+        // 的（字形光栅化和文本测量缓存都挂在它上面，每帧重建就白丢了）。漏掉
+        // clear() 的话，每帧都在上一帧的几何后面再追加一整份 UI：
+        //   - 界面静止时看不出来，同一批图形画在同一位置，叠多少层都一样；
+        //   - 一旦 resize、布局变了，旧尺寸的文字和矩形还留在列表里，和新布局
+        //     一起渲染 —— 屏幕上就是旧文字、旧图形和新的一起重影；
+        //   - 列表只涨不缩，拖得越久每帧要画的几何越多，还会越来越卡。
+        // 这正是「resize 之后文字图形叠影」的根因。
+        list.clear();
         {
             // 逐字段借用，绕开闭包对 self 的整体占用
             let ui_state = &mut self.ui_state;

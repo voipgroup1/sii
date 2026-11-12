@@ -80,8 +80,12 @@ GIF 播放器最容易做错的地方是**帧合成**。GIF 的每一帧可能�
   和 `performance.now()` 会缓慢漂移；画面按绝对时间查帧表，不做累加，误差不累积。
 - **画布尺寸只在真的变了才动。** `ResizeObserver` 驱动，wasm 每帧只读缓存值。
   每帧读 `clientWidth` 是 forced reflow，每帧给 `canvas.width` 赋值会重建
-  swapchain —— 两件事加起来就是「resize 之后又慢又叠」。尺寸变过的那一帧直接
-  丢掉，等新 swapchain 交接完再画。
+  swapchain —— 两件事都会让 resize 变慢。尺寸变过的那一帧直接丢掉，等新
+  swapchain 交接完再画。
+- **`DrawList` 每帧必须 `clear()`。** wgpu-gameui 的 `Frame::run` 只往列表里追加
+  几何，不会替你清；列表又跨帧复用（字形和测量缓存在上面）。漏掉这一步就会每帧
+  叠一层：静止时看不出来，resize 后旧布局的文字和图形还留着，跟新的一起画 ——
+  这就是「文字图形叠影」的真正原因。
 
 ## 跑起来
 
