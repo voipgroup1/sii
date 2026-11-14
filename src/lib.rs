@@ -17,7 +17,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wgpu_gameui::{
     load_font_bytes, shared_font_system, DrawList, FontSystemHandle, Frame, InputState,
-    KeyboardNav, Theme, UiContext, UiRenderer, UiState,
+    KeyboardNav, StyleKey, Theme, UiContext, UiRenderer, UiState,
 };
 
 use gifdoc::Doc;
@@ -28,6 +28,42 @@ const TOP_H: f32 = 52.0;
 const LEFT_W: f32 = 190.0;
 const RIGHT_W: f32 = 272.0;
 const BOTTOM_H: f32 = 104.0;
+
+/// 按钮配色参考：近黑底上的深炭灰圆角块、浅灰字、选中/主操作填青色。
+/// 只调视觉 token，不动布局；左栏和顶栏的几何仍由各面板自己决定。
+fn ui_theme() -> Theme {
+    let mut t = Theme::default();
+    // 底色再压暗一点，让 #2b2f34 的按钮块浮起来
+    t.background = [0.0627, 0.0706, 0.0824, 1.0]; // #101215
+    t.panel = [0.0941, 0.1020, 0.1137, 0.96]; // #181a1d
+    // 参考图按钮：#2b2f34，悬停提亮一档，按下回落到 #222529
+    t.button = [0.1686, 0.1843, 0.2039, 1.0];
+    t.button_hover = [0.2039, 0.2196, 0.2431, 1.0];
+    t.button_pressed = [0.1333, 0.1451, 0.1608, 1.0];
+    t.button_border = [0.0, 0.0, 0.0, 0.35];
+    t.text = [0.8706, 0.8863, 0.9059, 1.0]; // #dee2e7
+    t.text_dim = [0.6118, 0.6431, 0.6745, 1.0]; // #9ca4ac
+    // 选中态青：#00b3b8，和参考图里那块高亮按钮一致
+    t.accent = [0.0, 0.7020, 0.7216, 1.0];
+    t.accent_face_top = [0.1647, 0.8039, 0.8196, 1.0];
+    t.accent_face_bottom = [0.0, 0.6588, 0.6784, 1.0];
+    t.on_accent = [1.0, 1.0, 1.0, 1.0];
+    t.focus_ring = t.accent;
+    t.input_focus_border = t.accent;
+    t.progress_fill = t.accent;
+    // 圆角块 + 更松的间距，贴近参考图的方形工具按钮
+    t.border_radius = 7.0;
+    t.button_height = 30.0;
+    t.padding = 8.0;
+    t.spacing = 8.0;
+    // 顶部高光收敛，避免默认 4a 材质在深色块上显得太"鼓"
+    t.face_top = [1.0, 1.0, 1.0, 0.10];
+    t.face_top_hover = [1.0, 1.0, 1.0, 0.14];
+    t.face_bottom = [1.0, 1.0, 1.0, 0.035];
+    t.edge_highlight = [1.0, 1.0, 1.0, 0.12];
+    t.animation_duration = 0.10;
+    t
+}
 
 /// 内存预算：超过就提示抽帧。浏览器单标签页 wasm 内存上限大概 2~4 GB。
 const MEMORY_BUDGET: usize = 768 * 1024 * 1024;
@@ -738,6 +774,20 @@ fn at(ui: &mut UiContext, x: f32, y: f32) {
     ui.translate(x - c[0], y - c[1]);
 }
 
+/// 选中态 / 主操作按钮：临时把按钮面和字色切成参考图里的青色，
+/// 再走标准 text_button —— 键盘焦点、悬停动画、点击判定都保持原生行为。
+fn accent_button(ui: &mut UiContext, label: &str, w: f32, h: f32) -> bool {
+    ui.push();
+    ui.set_style_color(StyleKey::Button, [0.0, 0.7020, 0.7216, 1.0]);
+    ui.set_style_color(StyleKey::ButtonHover, [0.0784, 0.7569, 0.7765, 1.0]);
+    ui.set_style_color(StyleKey::ButtonPressed, [0.0, 0.5765, 0.5961, 1.0]);
+    ui.set_style_color(StyleKey::ButtonBorder, [0.0, 0.0, 0.0, 0.0]);
+    ui.set_style_color(StyleKey::Text, [1.0, 1.0, 1.0, 1.0]);
+    let clicked = ui.text_button(label, Some(w), Some(h));
+    ui.pop();
+    clicked
+}
+
 fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
     // ---------------- 顶栏 ----------------
     let mut x = 12.0;
@@ -749,14 +799,19 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
 
     at(ui, x, 10.0);
     let export_label = if v.exporting { "导出中…" } else { "导出 GIF" };
-    if ui.text_button(export_label, Some(84.0), Some(32.0)) && !v.exporting {
+    if accent_button(ui, export_label, 84.0, 32.0) && !v.exporting {
         a.export = true;
     }
     x += 92.0;
 
     at(ui, x, 10.0);
     let play_label = if v.playing { "暂停" } else { "播放" };
-    if ui.text_button(play_label, Some(64.0), Some(32.0)) {
+    let play_clicked = if v.playing {
+        accent_button(ui, play_label, 64.0, 32.0)
+    } else {
+        ui.text_button(play_label, Some(64.0), Some(32.0))
+    };
+    if play_clicked {
         a.toggle_play = true;
     }
     x += 72.0;
@@ -806,21 +861,28 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
 
     let btn = |ui: &mut UiContext, y: &mut f32, label: &str, flag: &mut bool| {
         at(ui, lx, *y);
-        if ui.text_button(label, Some(LEFT_W - 24.0), Some(28.0)) {
+        if ui.text_button(label, Some(LEFT_W - 24.0), Some(30.0)) {
             *flag = true;
         }
-        *y += 34.0;
+        *y += 36.0;
+    };
+    // 组与组之间画一条细分隔线，对应参考图里每段工具之间的间隔
+    let group_gap = |ui: &mut UiContext, y: &mut f32| {
+        *y += 3.0;
+        at(ui, lx + 4.0, *y);
+        ui.quad(LEFT_W - 32.0, 1.0, [1.0, 1.0, 1.0, 0.07]);
+        *y += 9.0;
     };
 
     btn(ui, &mut ly, "复制帧", &mut a.op_duplicate);
     btn(ui, &mut ly, "删除帧", &mut a.op_delete);
     btn(ui, &mut ly, "上移", &mut a.op_up);
     btn(ui, &mut ly, "下移", &mut a.op_down);
-    ly += 6.0;
+    group_gap(ui, &mut ly);
     btn(ui, &mut ly, "水平翻转", &mut a.op_flip_h);
     btn(ui, &mut ly, "垂直翻转", &mut a.op_flip_v);
     btn(ui, &mut ly, "反色", &mut a.op_invert);
-    ly += 6.0;
+    group_gap(ui, &mut ly);
     btn(ui, &mut ly, "缩放到 50%", &mut a.op_scale_half);
     btn(ui, &mut ly, "缩放到 200%", &mut a.op_scale_double);
     btn(ui, &mut ly, "抽帧到内存预算", &mut a.op_thin);
@@ -980,7 +1042,12 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
 
         at(ui, rx, ry);
         let play_label = if v.audio_playing { "停止音频" } else { "试听这一段" };
-        if ui.text_button(play_label, Some(rw), Some(26.0)) {
+        let play_clicked = if v.audio_playing {
+            accent_button(ui, play_label, rw, 26.0)
+        } else {
+            ui.text_button(play_label, Some(rw), Some(26.0))
+        };
+        if play_clicked {
             if v.audio_playing {
                 a.audio_stop = true;
             } else {
@@ -1465,7 +1532,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
         preview,
         ui,
         ui_state: UiState::new(),
-        theme: Theme::default(),
+        theme: ui_theme(),
         draw_list: Some(draw_list),
         input: input.clone(),
         size,
