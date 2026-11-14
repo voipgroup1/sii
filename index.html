@@ -443,7 +443,10 @@ window.__sii = {
     const t0 = performance.now();
     try {
       const bytes = await encodeInWorker(snapshot, speed);
-      this.download(bytes);
+      // 不能写 this.download：wasm 用 Function.call2(null, ...) 调进来，
+      // 模块脚本是严格模式，this 就是 null（以前这里报 "Cannot read
+      // properties of null (reading 'download')"）。直接走命名空间对象。
+      window.__sii.download(bytes);
       const ms = Math.round(performance.now() - t0);
       wasmApi?.export_status(
         true,

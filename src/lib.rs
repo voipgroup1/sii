@@ -1182,7 +1182,9 @@ fn js_call0(name: &str) {
     if let Some(ns) = js_ns() {
         if let Ok(f) = js_sys::Reflect::get(&ns, &JsValue::from_str(name)) {
             if f.is_function() {
-                let _ = js_sys::Function::from(f).call0(&JsValue::NULL);
+                // thisArg 传命名空间对象，别传 null：JS 侧是模块脚本（严格模式），
+                // 方法里的 this 会原样保留成 null，写成 this.xxx 就直接炸。
+                let _ = js_sys::Function::from(f).call0(&ns);
             }
         }
     }
@@ -1194,7 +1196,7 @@ fn js_call_bytes(name: &str, bytes: &[u8]) {
         if let Ok(f) = js_sys::Reflect::get(&ns, &JsValue::from_str(name)) {
             if f.is_function() {
                 let arr = js_sys::Uint8Array::from(bytes);
-                let _ = js_sys::Function::from(f).call1(&JsValue::NULL, &arr);
+                let _ = js_sys::Function::from(f).call1(&ns, &arr);
             }
         }
     }
@@ -1208,7 +1210,7 @@ fn js_call_export(bytes: &[u8], speed: i32) {
             if f.is_function() {
                 let arr = js_sys::Uint8Array::from(bytes);
                 let _ = js_sys::Function::from(f).call2(
-                    &JsValue::NULL,
+                    &ns,
                     &arr,
                     &JsValue::from_f64(speed as f64),
                 );
