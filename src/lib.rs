@@ -17,7 +17,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wgpu_gameui::{
     load_font_bytes, shared_font_system, DrawList, FontSystemHandle, Frame, InputState,
-    KeyboardNav, StyleKey, Theme, UiContext, UiRenderer, UiState,
+    KeyboardNav, StyleKey, TextAlign, TextBlock, Theme, UiContext, UiRenderer, UiState,
 };
 
 use gifdoc::Doc;
@@ -28,6 +28,11 @@ const TOP_H: f32 = 52.0;
 const LEFT_W: f32 = 190.0;
 const RIGHT_W: f32 = 272.0;
 const BOTTOM_H: f32 = 104.0;
+
+/// 按钮标签的排版参数：theme 和自绘标签共用一份，避免两处漂移。
+const BTN_FONT_SIZE: f32 = 13.0;
+const BTN_PADDING: f32 = 8.0;
+const BTN_TEXT: [f32; 4] = [0.8706, 0.8863, 0.9059, 1.0]; // #dee2e7
 
 /// 按钮配色参考：近黑底上的深炭灰圆角块、浅灰字、选中/主操作填青色。
 /// 只调视觉 token，不动布局；左栏和顶栏的几何仍由各面板自己决定。
@@ -41,7 +46,8 @@ fn ui_theme() -> Theme {
     t.button_hover = [0.2039, 0.2196, 0.2431, 1.0];
     t.button_pressed = [0.1333, 0.1451, 0.1608, 1.0];
     t.button_border = [0.0, 0.0, 0.0, 0.35];
-    t.text = [0.8706, 0.8863, 0.9059, 1.0]; // #dee2e7
+    t.text = BTN_TEXT;
+    t.font_size = BTN_FONT_SIZE;
     t.text_dim = [0.6118, 0.6431, 0.6745, 1.0]; // #9ca4ac
     // 选中态青：#00b3b8，和参考图里那块高亮按钮一致
     t.accent = [0.0, 0.7020, 0.7216, 1.0];
@@ -54,7 +60,7 @@ fn ui_theme() -> Theme {
     // 圆角块 + 更松的间距，贴近参考图的方形工具按钮
     t.border_radius = 7.0;
     t.button_height = 30.0;
-    t.padding = 8.0;
+    t.padding = BTN_PADDING;
     t.spacing = 8.0;
     // 顶部高光收敛，避免默认 4a 材质在深色块上显得太"鼓"
     t.face_top = [1.0, 1.0, 1.0, 0.10];
@@ -774,16 +780,60 @@ fn at(ui: &mut UiContext, x: f32, y: f32) {
     ui.translate(x - c[0], y - c[1]);
 }
 
-/// 选中态 / 主操作按钮：临时把按钮面和字色切成参考图里的青色，
-/// 再走标准 text_button —— 键盘焦点、悬停动画、点击判定都保持原生行为。
+/// 文字居中的按钮。
+///
+/// 依赖里的按钮标签走 ellipsize 分支：排版 buffer 被收缩成内容宽度，
+/// `TextAlign::Center` 没有可分配余量，标签实际总是贴左。上游修复还没进
+/// 依赖版本，这里先用空标签的 text_button 画按钮面（点击、焦点环、悬停/
+/// 按下动画都保持原生行为），再把标签按 Center 自绘上去。
+/// wgpu-gameui 修好 ellipsize 的排版宽度后（本地提交 d1494d0），本函数可删。
+fn centered_button_colored(
+    ui: &mut UiContext,
+    label: &str,
+    w: f32,
+    h: f32,
+    color: [f32; 4],
+) -> bool {
+    let [x0, y0] = ui.cursor();
+    // 空标签的 text_button 只画按钮面；标签下面自绘。
+    let clicked = ui.text_button("", Some(w), Some(h));
+    let [x1, y1] = ui.cursor();
+    // text_button 返回时布局光标已下移（按钮高 + item_gap）；先退回按钮原点，
+    // 标签用局部坐标画，画完再恢复光标，后续按钮的排布不受影响。
+    ui.translate(x0 - x1, y0 - y1);
+    let inset = BTN_PADDING.min(w * 0.15);
+    let text_y = ui
+        .list()
+        .vcentered_text_y(0.0, h, BTN_FONT_SIZE, None, label);
+    ui.text_block(
+        TextBlock::new(label, inset, text_y)
+            .with_size(BTN_FONT_SIZE)
+            .with_color(
+                (color[0] * 255.0) as u8,
+                (color[1] * 255.0) as u8,
+                (color[2] * 255.0) as u8,
+            )
+            .with_max_width((w - inset * 2.0).max(0.0))
+            .with_align(TextAlign::Center),
+    );
+    ui.translate(x1 - x0, y1 - y0);
+    clicked
+}
+
+/// 普通按钮：浅灰标签。
+fn centered_button(ui: &mut UiContext, label: &str, w: f32, h: f32) -> bool {
+    centered_button_colored(ui, label, w, h, BTN_TEXT)
+}
+
+/// 选中态 / 主操作按钮：临时把按钮面切成参考图里的青色，白色标签。
+/// 点击、键盘焦点、悬停/按下动画仍走原生 text_button。
 fn accent_button(ui: &mut UiContext, label: &str, w: f32, h: f32) -> bool {
     ui.push();
     ui.set_style_color(StyleKey::Button, [0.0, 0.7020, 0.7216, 1.0]);
     ui.set_style_color(StyleKey::ButtonHover, [0.0784, 0.7569, 0.7765, 1.0]);
     ui.set_style_color(StyleKey::ButtonPressed, [0.0, 0.5765, 0.5961, 1.0]);
     ui.set_style_color(StyleKey::ButtonBorder, [0.0, 0.0, 0.0, 0.0]);
-    ui.set_style_color(StyleKey::Text, [1.0, 1.0, 1.0, 1.0]);
-    let clicked = ui.text_button(label, Some(w), Some(h));
+    let clicked = centered_button_colored(ui, label, w, h, [1.0, 1.0, 1.0, 1.0]);
     ui.pop();
     clicked
 }
@@ -792,7 +842,7 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
     // ---------------- 顶栏 ----------------
     let mut x = 12.0;
     at(ui, x, 10.0);
-    if ui.text_button("打开 GIF", Some(84.0), Some(32.0)) {
+    if centered_button(ui, "打开 GIF", 84.0, 32.0) {
         a.open = true;
     }
     x += 92.0;
@@ -809,7 +859,7 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
     let play_clicked = if v.playing {
         accent_button(ui, play_label, 64.0, 32.0)
     } else {
-        ui.text_button(play_label, Some(64.0), Some(32.0))
+        centered_button(ui, play_label, 64.0, 32.0)
     };
     if play_clicked {
         a.toggle_play = true;
@@ -817,31 +867,31 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
     x += 72.0;
 
     at(ui, x, 10.0);
-    if ui.text_button("<", Some(36.0), Some(32.0)) {
+    if centered_button(ui, "<", 36.0, 32.0) {
         a.prev = true;
     }
     x += 44.0;
 
     at(ui, x, 10.0);
-    if ui.text_button(">", Some(36.0), Some(32.0)) {
+    if centered_button(ui, ">", 36.0, 32.0) {
         a.next = true;
     }
     x += 48.0;
 
     at(ui, x, 10.0);
-    if ui.text_button("适应", Some(52.0), Some(32.0)) {
+    if centered_button(ui, "适应", 52.0, 32.0) {
         a.zoom_fit = true;
     }
     x += 60.0;
 
     at(ui, x, 10.0);
-    if ui.text_button("-", Some(36.0), Some(32.0)) {
+    if centered_button(ui, "-", 36.0, 32.0) {
         a.zoom_out = true;
     }
     x += 44.0;
 
     at(ui, x, 10.0);
-    if ui.text_button("+", Some(36.0), Some(32.0)) {
+    if centered_button(ui, "+", 36.0, 32.0) {
         a.zoom_in = true;
     }
     x += 48.0;
@@ -861,7 +911,7 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
 
     let btn = |ui: &mut UiContext, y: &mut f32, label: &str, flag: &mut bool| {
         at(ui, lx, *y);
-        if ui.text_button(label, Some(LEFT_W - 24.0), Some(30.0)) {
+        if centered_button(ui, label, LEFT_W - 24.0, 30.0) {
             *flag = true;
         }
         *y += 36.0;
@@ -930,12 +980,12 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
     ui.text(&format!("{:.0} cs ≈ {:.0} ms", a.delay_cs, a.delay_cs * 10.0), Some(rw));
     ry += 22.0;
     at(ui, rx, ry);
-    if ui.text_button("写入当前帧", Some(rw), Some(26.0)) {
+    if centered_button(ui, "写入当前帧", rw, 26.0) {
         a.op_delay_to_frame = true;
     }
     ry += 32.0;
     at(ui, rx, ry);
-    if ui.text_button("写入全部帧", Some(rw), Some(26.0)) {
+    if centered_button(ui, "写入全部帧", rw, 26.0) {
         a.op_delay_to_all = true;
     }
     ry += 38.0;
@@ -953,7 +1003,7 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
     a.sat = ui.slider(4, v.sat, 0.0, 2.0, Some(rw));
     ry += 30.0;
     at(ui, rx, ry);
-    if ui.text_button("应用到全部帧", Some(rw), Some(26.0)) {
+    if centered_button(ui, "应用到全部帧", rw, 26.0) {
         a.op_apply_color = true;
     }
     ry += 38.0;
@@ -970,7 +1020,7 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
     ry += 22.0;
     at(ui, rx, ry);
     let duck_label = if v.duck_busy { "索引中…" } else { "索引到 DuckDB" };
-    if ui.text_button(duck_label, Some(rw), Some(26.0)) && !v.duck_busy {
+    if centered_button(ui, duck_label, rw, 26.0) && !v.duck_busy {
         a.op_duck_index = true;
     }
 
@@ -982,7 +1032,7 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
 
     if v.audio_duration_ms == 0 {
         at(ui, rx, ry);
-        if ui.text_button("加载音频…", Some(rw), Some(26.0)) {
+        if centered_button(ui, "加载音频…", rw, 26.0) {
             a.audio_pick = true;
         }
         ry += 30.0;
@@ -1045,7 +1095,7 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
         let play_clicked = if v.audio_playing {
             accent_button(ui, play_label, rw, 26.0)
         } else {
-            ui.text_button(play_label, Some(rw), Some(26.0))
+            centered_button(ui, play_label, rw, 26.0)
         };
         if play_clicked {
             if v.audio_playing {
@@ -1060,17 +1110,17 @@ fn build_ui(ui: &mut UiContext, v: UiView<'_>, a: &mut Actions) {
         ui.progress_bar(if v.audio_playing { v.audio_progress } else { 0.0 }, Some(rw));
         ry += 26.0;
         at(ui, rx, ry);
-        if ui.text_button("存到 DuckDB", Some(rw), Some(26.0)) {
+        if centered_button(ui, "存到 DuckDB", rw, 26.0) {
             a.audio_save = true;
         }
         ry += 32.0;
         at(ui, rx, ry);
-        if ui.text_button("换一个音频", Some(rw), Some(26.0)) {
+        if centered_button(ui, "换一个音频", rw, 26.0) {
             a.audio_pick = true;
         }
         ry += 32.0;
         at(ui, rx, ry);
-        if ui.text_button("移除音频", Some(rw), Some(26.0)) {
+        if centered_button(ui, "移除音频", rw, 26.0) {
             a.audio_clear = true;
         }
     }
