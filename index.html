@@ -217,6 +217,34 @@ canvasEl.addEventListener('wheel', e => {
 canvasEl.addEventListener('contextmenu', e => e.preventDefault());
 
 // ---------------------------------------------------------------- DuckDB 桥
+// DuckDB 的 BIGINT / HUGEINT 到 JS 侧是 BigInt，JSON.stringify 遇到直接抛
+// "Do not know how to serialize a BigInt"。而 count(*)、sum() 这些列全是
+// BIGINT，所以查询结果先统一转一遍：安全范围内转 Number，超了转字符串。
+function jsonSafe(v) {
+  if (typeof v === 'bigint') {
+    return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(v)
+      : v.toString();
+  }
+  if (Array.isArray(v)) return v.map(jsonSafe);
+  if (v && typeof v === 'object') {
+    // DuckDB 的 HUGEINT 是 Uint32Array 子类（4 个 32 位字），自带 toString，
+    // 直接按标量处理；否则会被拆成 {"0":6,"1":0,...} 这种鬼东西。
+    if (ArrayBuffer.isView(v)) {
+      const str = v.toString();
+      if (/^-?\d+$/.test(str)) {
+        const num = Number(str);
+        return Number.isSafeInteger(num) ? num : str;
+      }
+    }
+    if (typeof v.toJSON === 'function') return jsonSafe(v.toJSON());
+    const out = {};
+    for (const [k, x] of Object.entries(v)) out[k] = jsonSafe(x);
+    return out;
+  }
+  return v;
+}
+
 const duck = {
   db: null, conn: null, ready: null,
 
@@ -249,7 +277,7 @@ const duck = {
     const n = Math.min(table.numRows, 32);
     for (let i = 0; i < n; i++) {
       const row = table.get(i);
-      try { rows.push(row.toJSON()); } catch { rows.push({}); }
+      try { rows.push(jsonSafe(row.toJSON())); } catch { rows.push({}); }
     }
     return JSON.stringify({ numRows: table.numRows, rows });
   },
