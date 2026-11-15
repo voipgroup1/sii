@@ -104,6 +104,15 @@ Firefox 还在 nightly 后面。`navigator.gpu` 不存在时页面会直接告�
 
 仓库里带了构建好的 `pkg/`，所以也可以不装 Rust，直接起个静态服务器就能试。
 
+### 部署
+
+`main` 每次 push 会触发 `.github/workflows/pages.yml`：在 GitHub runner 上跑
+`cargo test --release --lib` → `./build.sh` → 拼 `dist/`（`index.html`、`worker.js`、
+`assets/`、`pkg/`）→ 发布到 <https://voipgroup1.github.io/sii/>。
+
+所以本地只改源码就行，不用留 `target/`；要本地预览再执行一次 `./build.sh`
+（构建产物默认落在 `~/.cache/sii-target`，不占 workspace）。
+
 ### 生成测试素材
 
 ```bash
