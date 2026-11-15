@@ -17,7 +17,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wgpu_gameui::{
     load_font_bytes, shared_font_system, DrawList, FontSystemHandle, Frame, InputState,
-    KeyboardNav, StyleKey, TextAlign, TextBlock, Theme, UiContext, UiRenderer, UiState,
+    KeyboardNav, StyleKey, Theme, UiContext, UiRenderer, UiState,
 };
 
 use gifdoc::Doc;
@@ -780,49 +780,9 @@ fn at(ui: &mut UiContext, x: f32, y: f32) {
     ui.translate(x - c[0], y - c[1]);
 }
 
-/// 文字居中的按钮。
-///
-/// 依赖里的按钮标签走 ellipsize 分支：排版 buffer 被收缩成内容宽度，
-/// `TextAlign::Center` 没有可分配余量，标签实际总是贴左。上游修复还没进
-/// 依赖版本，这里先用空标签的 text_button 画按钮面（点击、焦点环、悬停/
-/// 按下动画都保持原生行为），再把标签按 Center 自绘上去。
-/// wgpu-gameui 修好 ellipsize 的排版宽度后（本地提交 d1494d0），本函数可删。
-fn centered_button_colored(
-    ui: &mut UiContext,
-    label: &str,
-    w: f32,
-    h: f32,
-    color: [f32; 4],
-) -> bool {
-    let [x0, y0] = ui.cursor();
-    // 空标签的 text_button 只画按钮面；标签下面自绘。
-    let clicked = ui.text_button("", Some(w), Some(h));
-    let [x1, y1] = ui.cursor();
-    // text_button 返回时布局光标已下移（按钮高 + item_gap）；先退回按钮原点，
-    // 标签用局部坐标画，画完再恢复光标，后续按钮的排布不受影响。
-    ui.translate(x0 - x1, y0 - y1);
-    let inset = BTN_PADDING.min(w * 0.15);
-    let text_y = ui
-        .list()
-        .vcentered_text_y(0.0, h, BTN_FONT_SIZE, None, label);
-    ui.text_block(
-        TextBlock::new(label, inset, text_y)
-            .with_size(BTN_FONT_SIZE)
-            .with_color(
-                (color[0] * 255.0) as u8,
-                (color[1] * 255.0) as u8,
-                (color[2] * 255.0) as u8,
-            )
-            .with_max_width((w - inset * 2.0).max(0.0))
-            .with_align(TextAlign::Center),
-    );
-    ui.translate(x1 - x0, y1 - y0);
-    clicked
-}
-
-/// 普通按钮：浅灰标签。
+/// 普通按钮：浅灰标签，水平/垂直居中由原生 text_button 负责。
 fn centered_button(ui: &mut UiContext, label: &str, w: f32, h: f32) -> bool {
-    centered_button_colored(ui, label, w, h, BTN_TEXT)
+    ui.text_button(label, Some(w), Some(h))
 }
 
 /// 选中态 / 主操作按钮：临时把按钮面切成参考图里的青色，白色标签。
@@ -833,7 +793,8 @@ fn accent_button(ui: &mut UiContext, label: &str, w: f32, h: f32) -> bool {
     ui.set_style_color(StyleKey::ButtonHover, [0.0784, 0.7569, 0.7765, 1.0]);
     ui.set_style_color(StyleKey::ButtonPressed, [0.0, 0.5765, 0.5961, 1.0]);
     ui.set_style_color(StyleKey::ButtonBorder, [0.0, 0.0, 0.0, 0.0]);
-    let clicked = centered_button_colored(ui, label, w, h, [1.0, 1.0, 1.0, 1.0]);
+    ui.set_style_color(StyleKey::Text, [1.0, 1.0, 1.0, 1.0]);
+    let clicked = ui.text_button(label, Some(w), Some(h));
     ui.pop();
     clicked
 }

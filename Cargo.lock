@@ -317,7 +317,7 @@ dependencies = [
 [[package]]
 name = "fdsm"
 version = "0.8.0"
-source = "git+https://github.com/voipgroup1/wgpu-gameui#0fdfe7700f4ddbebd89b1a1823c991f1c3d2058b"
+source = "git+https://github.com/voipgroup1/wgpu-gameui#d1494d04de2c6fb56c0a76437bcac10807d82604"
 dependencies = [
  "image",
  "nalgebra",
@@ -1660,7 +1660,7 @@ dependencies = [
 [[package]]
 name = "wgpu-gameui"
 version = "0.1.0"
-source = "git+https://github.com/voipgroup1/wgpu-gameui#0fdfe7700f4ddbebd89b1a1823c991f1c3d2058b"
+source = "git+https://github.com/voipgroup1/wgpu-gameui#d1494d04de2c6fb56c0a76437bcac10807d82604"
 dependencies = [
  "bytemuck",
  "fdsm",
