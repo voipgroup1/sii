@@ -83,3 +83,9 @@ opt-level = "s"
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+[profile.dev]
+# 云主机磁盘紧：dev/test 构建不保留调试信息、不做增量。默认的 debug=2 +
+# incremental 会让 target/debug 轻松涨到 1.5G 以上，测试用不到那些信息。
+debug = 0
+incremental = false
