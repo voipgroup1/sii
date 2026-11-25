@@ -29,6 +29,12 @@ const LEFT_W: f32 = 190.0;
 const RIGHT_W: f32 = 272.0;
 const BOTTOM_H: f32 = 104.0;
 
+/// 预览缩放系数：大图缩到能放进预览区，小图保持原尺寸（1 图像 px = 1 CSS px），
+/// 不为了填满画布把图放大。zoom 在这个基准上再乘。
+fn fit_scale(pw: f32, ph: f32, dw: f32, dh: f32) -> f32 {
+    (pw / dw).min(ph / dh).min(1.0)
+}
+
 /// 按钮标签的排版参数：theme 和自绘标签共用一份，避免两处漂移。
 const BTN_FONT_SIZE: f32 = 13.0;
 const BTN_PADDING: f32 = 8.0;
@@ -358,8 +364,7 @@ impl App {
             Some(d) => {
                 let dw = d.width as f32;
                 let dh = d.height as f32;
-                let fit = (pw / dw).min(ph / dh);
-                let s = fit * self.zoom;
+                let s = fit_scale(pw, ph, dw, dh) * self.zoom;
                 (dw * s, dh * s)
             }
             None => (0.0, 0.0),
@@ -1657,4 +1662,25 @@ async fn load_cjk_font(fs: &FontSystemHandle) -> Result<String, String> {
         .set_sans_serif_family(handle.family().to_string());
 
     Ok(format!("{}（{} 字节）", handle.family(), bytes.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_scale;
+
+    #[test]
+    fn small_image_keeps_original_size() {
+        // 160×120 的图放进 818×564 的预览区：原尺寸，不拉伸
+        assert_eq!(fit_scale(818.0, 564.0, 160.0, 120.0), 1.0);
+        // 刚好放得下也还是 1.0
+        assert_eq!(fit_scale(160.0, 120.0, 160.0, 120.0), 1.0);
+    }
+
+    #[test]
+    fn large_image_scales_down_to_fit() {
+        // 4000×3000 放进 818×564：按高度缩
+        let s = fit_scale(818.0, 564.0, 4000.0, 3000.0);
+        assert!((s - 564.0 / 3000.0).abs() < 1e-6);
+        assert!(s < 1.0);
+    }
 }
